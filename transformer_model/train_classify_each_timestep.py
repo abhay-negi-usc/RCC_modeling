@@ -21,7 +21,7 @@ CONFIG = {
     "csv": "./data/RCC_combined_14_processed.csv",
     "wrench_cols": ["FX", "FY", "FZ", "TX", "TY", "TZ"],
     "label_cols": ["X_class", "Y_class", "Z_class", "A_class", "B_class", "C_class"],
-    "window": 128,
+    "window": 256,
     "stride": 64,
     "batch_size": 4096,
     "epochs": 1_000_000,
@@ -29,7 +29,7 @@ CONFIG = {
     "val_split": 0.2,
     "d_model": 64,
     "nhead": 8,
-    "layers": 4,
+    "layers": 8,
     "ffn": 128,
     "dropout": 0.0,
     "use_cls": False,  # Per-timestep classification uses sequence outputs directly

@@ -2,3 +2,4 @@ data
 */checkpoint*
 *wandb*
 __pycache__
+./regression_transformer_model/checkpoints

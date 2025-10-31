@@ -28,15 +28,15 @@ CONFIG = {
     "wrench_cols": ["FX", "FY", "FZ", "TX", "TY", "TZ"],
     "pose_cols": ["X", "Y", "Z", "A", "B", "C"],
     "label_cols": ["X_class", "Y_class", "Z_class", "A_class", "B_class", "C_class"],
-    "window": 128,
+    "window": 256,
     "stride": 64,
-    "batch_size": 2048,
+    "batch_size": 512,
     "epochs": 1_000_000,
     "lr": 1e-4,
     "val_split": 0.2,
     "d_model": 64,
     "nhead": 8,
-    "layers": 6,
+    "layers": 8,
     "ffn": 128,
     "dropout": 0.0,
     "use_cls": True,
@@ -45,13 +45,13 @@ CONFIG = {
     "save_every": 10,  # Save checkpoint every N epochs
     "wandb_project": "rcc_transformer_wrench_pose",
     "wandb_name": None,  # Auto-generated if None
-    "continue_from": "best", # "best",  # "best", "latest", or path to checkpoint file, or None to start fresh
+    "continue_from": None, # "best",  # "best", "latest", or path to checkpoint file, or None to start fresh
     
     # Class imbalance handling
     "use_class_weights": False,  # Use inverse frequency weighting
     "use_focal_loss": True,    # Use focal loss instead of weighted CE
     "focal_alpha": 1.0,         # Focal loss alpha parameter
-    "focal_gamma": 5.0,         # Focal loss gamma parameter (higher = more focus on hard examples)
+    "focal_gamma": 20.0,         # Focal loss gamma parameter (higher = more focus on hard examples)
     "label_smoothing": 0.0,     # Label smoothing factor (0.0 = no smoothing, 0.1 = 10% smoothing)
 }
 

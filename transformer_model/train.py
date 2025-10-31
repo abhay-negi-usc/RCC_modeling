@@ -29,7 +29,7 @@ CONFIG = {
     "stride": 64,
     "batch_size": 4096,
     "epochs": 1_000_000,
-    "lr": 1e-4,
+    "lr": 1e-3,
     "val_split": 0.2,
     "d_model": 64,
     "nhead": 8,
@@ -42,7 +42,7 @@ CONFIG = {
     "save_every": 10,  # Save checkpoint every N epochs
     "wandb_project": "rcc_transformer",
     "wandb_name": None,  # Auto-generated if None
-    "continue_from": None, # "best",  # "best", "latest", or path to checkpoint file, or None to start fresh
+    "continue_from": "best", # "best",  # "best", "latest", or path to checkpoint file, or None to start fresh
     
     # Class imbalance handling
     "use_class_weights": False,  # Use inverse frequency weighting

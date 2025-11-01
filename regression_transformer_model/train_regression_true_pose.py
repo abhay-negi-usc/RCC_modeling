@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train a Transformer to REGRESS EACH TIMESTEP of a wrench+relative-pose time-series chunk into a 6D continuous vector
+Train a Transformer to REGRESS EACH TIMESTEP of a wrench+true-pose time-series chunk into a 6D continuous vector
 (values are in columns: X_norm, Y_norm, Z_norm, A_norm, B_norm, C_norm) — i.e., output a value for
 every timestep and each of the 6 dimensions.
 
 Assumptions / Notes:
 - CSV must contain 6 wrench columns, 6 absolute pose columns, and 6 per-timestep regression columns.
 - Wrench columns: FX,FY,FZ,TX,TY,TZ
-- Pose columns: X,Y,Z,A,B,C (absolute); converted to relative per chunk (first pose is zero reference)
+- Pose columns: X,Y,Z,A,B,C (absolute, used as-is; no per-chunk relative conversion)
 - Target columns: X_norm,Y_norm,Z_norm,A_norm,B_norm,C_norm
-- Normalization: per-file z-score for each wrench channel (fit on the whole file). Pose is not normalized, only converted to relative per chunk.
+- Normalization: per-file z-score for each wrench channel (fit on the whole file). Pose is not normalized, used as true/absolute.
 - Split: first (1 - val-split) for train, last (val-split) for val, preserving time order.
 
 Usage:
-Configure the config dict below and run: python train_regression.py
+Configure the config dict below and run: python train_regression_true_pose.py
 
 Requires: torch, pandas, numpy
 """
@@ -37,7 +37,8 @@ CONFIG = {
     "dropout": 0.1,
     "use_cls": False,  # Per-timestep regression uses sequence outputs directly
     "seed": 42,
-    "out_dir": "./regression_transformer_model/checkpoints",
+    # Save/load checkpoints, predictions, and artifacts in a separate directory for true-pose runs
+    "out_dir": "./regression_transformer_model/checkpoints_true_pose",
     "save_every": 100,  # Save checkpoint every N epochs
     "wandb_project": "rcc_regression_transformer",
     "wandb_name": None,  # Auto-generated if None
@@ -78,18 +79,7 @@ def zscore_fit(x: np.ndarray, eps: float = 1e-8) -> Tuple[np.ndarray, np.ndarray
 def zscore_apply(x: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
     return (x - mu) / sd
 
-# Add relative pose utility similar to train_wrench_and_pose.py
-
-def compute_relative_pose(pose_chunk: np.ndarray) -> np.ndarray:
-    """
-    Convert absolute pose to relative pose per chunk: first pose becomes zero reference.
-    pose_chunk: (T, 6) -> returns (T, 6)
-    """
-    if len(pose_chunk) == 0:
-        return pose_chunk
-    reference_pose = pose_chunk[0:1, :]
-    relative_pose = pose_chunk - reference_pose
-    return relative_pose.astype(np.float32)
+# Using true (absolute) pose directly; no relative conversion per chunk is applied in this script.
 
 # ----------------------------
 # Dataset
@@ -117,7 +107,7 @@ class WrenchPoseChunkDataset(Dataset):
         """
         Use rows in [start, end) to create chunks.
         Returns per-timestep REGRESSION targets for each chunk.
-        Input features are concatenated: [normalized wrench (6), relative pose (6)] -> 12 dims per timestep.
+        Input features are concatenated: [normalized wrench (6), true pose (6)] -> 12 dims per timestep.
         """
         assert len(wrench_cols) == 6, "Need exactly 6 wrench columns."
         assert len(pose_cols) == 6, "Need exactly 6 pose columns."
@@ -149,9 +139,9 @@ class WrenchPoseChunkDataset(Dataset):
         s = self.indices[i]
         e = s + self.cfg.window
         wrench_chunk = self.wrench[s:e, :]              # (T, 6)
-        pose_chunk = self.pose[s:e, :]                  # (T, 6) absolute
-        rel_pose_chunk = compute_relative_pose(pose_chunk)  # (T, 6)
-        x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)  # (T, 12)
+        pose_chunk = self.pose[s:e, :]                  # (T, 6) absolute (true pose)
+        # Use true (absolute) pose directly
+        x = np.concatenate([wrench_chunk, pose_chunk], axis=1).astype(np.float32)  # (T, 12)
         targets_Tx6 = self.labels[s:e, :].astype(np.float32)  # (T, 6)
         return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
 
@@ -514,7 +504,7 @@ def main():
     os.makedirs(config["out_dir"], exist_ok=True)
 
     # Initialize wandb
-    wandb_name = config["wandb_name"] or f"rcc_transformer_regression_{config['window']}w_{config['stride']}s"
+    wandb_name = config["wandb_name"] or f"rcc_transformer_regression_truepose_{config['window']}w_{config['stride']}s"
     wandb.init(
         project=config["wandb_project"],
         name=wandb_name,
@@ -580,7 +570,7 @@ def main():
             print("Starting training from scratch")
 
     print(f"Train chunks: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}")
-    print(f"Input features: 12 (6 wrench + 6 relative pose)")
+    print(f"Input features: 12 (6 wrench + 6 true pose)")
 
     for epoch in range(start_epoch, config["epochs"] + 1):
         tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)

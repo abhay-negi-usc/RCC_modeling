@@ -38,21 +38,27 @@ CONFIG = {
     "wrench_cols": ["Fx_ati", "Fy_ati", "Fz_ati", "Tx_ati", "Ty_ati", "Tz_ati"],
     "pose_cols": ["X", "Y", "Z", "A", "B", "C"],
     "label_cols": ["X_norm", "Y_norm", "Z_norm", "A_norm", "B_norm", "C_norm"],
-    "window": 2048,
-    "stride": 512,
-    "batch_size": 64,
+    "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
+    "window": 8192,
+    "stride": 1024,
+    "batch_size": 128,
     "epochs": 1_000_000,
-    "lr": 1e-3,
+    "lr": 1e-4,
     "val_split": 0.2,
     "seed": 42,
 
     # CNN architecture (replaces Transformer params)
-    "cnn_hidden": 128,            # base channels per residual block
+    "cnn_hidden": 64,            # base channels per residual block
     "cnn_layers": 6,              # number of residual blocks (controls depth and receptive field)
-    "cnn_kernel": 7,              # odd kernel for SAME-length convolution
+    "cnn_kernel": 5,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
     "cnn_dilation_base": 2,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
     "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
+
+    # Random-chunk training
+    # Number of randomly sampled, fixed-length train chunks per epoch. If None, defaults to the
+    # number of stride-based windows that fit within each trial in the training split (for similar epoch size).
+    "train_samples_per_epoch": None,
 
     "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints/",
     "save_every": 100,
@@ -72,7 +78,7 @@ CONFIG = {
 import math
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -104,6 +110,39 @@ def compute_relative_pose(pose_chunk: np.ndarray) -> np.ndarray:
     relative_pose = pose_chunk - reference_pose
     return relative_pose.astype(np.float32)
 
+
+def compute_trial_segments(trials: np.ndarray, start: int, end: int) -> List[Tuple[int, int]]:
+    """Return contiguous [s,e) segments between start and end indices where `trial` value is constant."""
+    segments: List[Tuple[int, int]] = []
+    i = max(0, start)
+    end = min(len(trials), end)
+    if i >= end:
+        return segments
+    while i < end:
+        tval = trials[i]
+        j = i + 1
+        while j < end and trials[j] == tval:
+            j += 1
+        segments.append((i, j))
+        i = j
+    return segments
+
+
+def filter_segments_by_trials(segments: List[Tuple[int, int]], trials: np.ndarray, allowed: Optional[Set]) -> List[Tuple[int, int]]:
+    """Keep only segments whose trial id (at start index) is in `allowed` if provided."""
+    if not allowed:
+        return segments
+    return [(s, e) for (s, e) in segments if trials[s] in allowed]
+
+
+def count_stride_windows_in_segments(segments: List[Tuple[int, int]], window: int, stride: int) -> int:
+    total = 0
+    for s, e in segments:
+        seg_len = e - s
+        if seg_len >= window:
+            total += max(0, (seg_len - window) // stride + 1)
+    return total
+
 # ----------------------------
 # Dataset
 # ----------------------------
@@ -127,6 +166,8 @@ class WrenchPoseChunkDataset(Dataset):
         wrench_norm_sd: np.ndarray,
         start: int,
         end: int,
+        trial_col: str,
+        allowed_trials: Optional[Set] = None,
     ):
         assert len(wrench_cols) == 6, "Need exactly 6 wrench columns."
         assert len(pose_cols) == 6, "Need exactly 6 pose columns."
@@ -134,19 +175,23 @@ class WrenchPoseChunkDataset(Dataset):
         self.wrench = df[wrench_cols].values.astype(np.float32)
         self.pose = df[pose_cols].values.astype(np.float32)
         self.labels = df[label_cols].values.astype(np.float32)
+        self.trials = df[trial_col].values
         # Normalize wrench only
         self.wrench = zscore_apply(self.wrench, wrench_norm_mu, wrench_norm_sd).astype(np.float32)
 
         self.cfg = cfg
         self.start = max(0, start)
         self.end = min(len(df), end)
+        all_segments = compute_trial_segments(self.trials, self.start, self.end)
+        self.segments = filter_segments_by_trials(all_segments, self.trials, allowed_trials)
         self.indices = self._make_indices()
 
     def _make_indices(self) -> List[int]:
-        T = self.end - self.start
-        if T < self.cfg.window:
-            return []
-        idxs = list(range(self.start, self.end - self.cfg.window + 1, self.cfg.stride))
+        # Build stride-based window starts within each trial segment; do not cross trial boundaries
+        idxs: List[int] = []
+        for s, e in self.segments:
+            if e - s >= self.cfg.window:
+                idxs.extend(range(s, e - self.cfg.window + 1, self.cfg.stride))
         return idxs
 
     def __len__(self):
@@ -160,6 +205,70 @@ class WrenchPoseChunkDataset(Dataset):
         rel_pose_chunk = compute_relative_pose(pose_chunk)  # (T, 6)
         x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)  # (T, 12)
         targets_Tx6 = self.labels[s:e, :].astype(np.float32)  # (T, 6)
+        return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
+
+
+class RandomWrenchPoseChunkDataset(Dataset):
+    """Randomly sample fixed-length chunks that never cross trial boundaries.
+
+    Length of the dataset controls how many random samples per epoch are drawn. Each __getitem__
+    independently samples a trial segment, then a random valid start within that segment.
+    """
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        wrench_cols: List[str],
+        pose_cols: List[str],
+        label_cols: List[str],
+        window: int,
+        wrench_norm_mu: np.ndarray,
+        wrench_norm_sd: np.ndarray,
+        start: int,
+        end: int,
+        trial_col: str,
+        samples_per_epoch: int,
+        rng: np.random.Generator | None = None,
+        allowed_trials: Optional[Set] = None,
+    ):
+        assert len(wrench_cols) == 6 and len(pose_cols) == 6 and len(label_cols) == 6
+        self.wrench = df[wrench_cols].values.astype(np.float32)
+        self.pose = df[pose_cols].values.astype(np.float32)
+        self.labels = df[label_cols].values.astype(np.float32)
+        self.trials = df[trial_col].values
+        self.wrench = zscore_apply(self.wrench, wrench_norm_mu, wrench_norm_sd).astype(np.float32)
+
+        self.window = window
+        self.start = max(0, start)
+        self.end = min(len(df), end)
+        all_segments = compute_trial_segments(self.trials, self.start, self.end)
+        all_segments = filter_segments_by_trials(all_segments, self.trials, allowed_trials)
+        # Keep only segments that can fit at least one window
+        self.valid_segments = [(s, e) for (s, e) in all_segments if (e - s) >= self.window]
+        self.starts_per_segment = np.array([(e - s) - self.window + 1 for (s, e) in self.valid_segments], dtype=np.int64)
+        self.total_starts = int(self.starts_per_segment.sum())
+        if self.total_starts <= 0:
+            self.samples_per_epoch = 0
+        else:
+            self.samples_per_epoch = int(samples_per_epoch)
+        self.probs = (self.starts_per_segment / self.total_starts) if self.total_starts > 0 else None
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx):  # idx is ignored; we draw randomly per call
+        # Sample a segment proportional to number of valid starts inside it
+        seg_idx = int(self.rng.choice(len(self.valid_segments), p=self.probs))
+        s, e = self.valid_segments[seg_idx]
+        max_offset = (e - s) - self.window + 1
+        start_idx = int(s + self.rng.integers(0, max_offset))
+        end_idx = start_idx + self.window
+
+        wrench_chunk = self.wrench[start_idx:end_idx, :]
+        pose_chunk = self.pose[start_idx:end_idx, :]
+        rel_pose_chunk = compute_relative_pose(pose_chunk)
+        x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)
+        targets_Tx6 = self.labels[start_idx:end_idx, :].astype(np.float32)
         return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
 
 # ----------------------------
@@ -457,7 +566,7 @@ def load_checkpoint(checkpoint_path: str, model, optimizer=None):
 def main():
     config = CONFIG
     torch.manual_seed(config["seed"])
-    np.random.seed(config["seed"]) 
+    np.random.seed(config["seed"])
 
     os.makedirs(config["out_dir"], exist_ok=True)
 
@@ -469,27 +578,63 @@ def main():
     for c in config["wrench_cols"] + config["pose_cols"] + config["label_cols"]:
         if c not in df.columns:
             raise ValueError(f"Column '{c}' not found in CSV. Available: {list(df.columns)}")
+    if config.get("trial_col") not in df.columns:
+        raise ValueError(f"Trial column '{config.get('trial_col')}' not found in CSV. Columns: {list(df.columns)}")
 
     # Fit normalization on the whole file (wrench channels only)
     wrench_all = df[config["wrench_cols"]].values.astype(np.float32)
     mu, sd = zscore_fit(wrench_all)
 
-    # Time-preserving split indices
+    # Trial-aware split by trials, not by contiguous rows
+    trial_col = config["trial_col"]
+    trials_arr = df[trial_col].values
+    unique_trials = pd.unique(trials_arr)  # preserves order of appearance
+    rng = np.random.default_rng(config["seed"])  # deterministic
+    perm = rng.permutation(len(unique_trials))
+    n_val_trials = max(1, int(math.ceil(len(unique_trials) * config["val_split"])))
+    val_trial_ids = set(unique_trials[perm[:n_val_trials]])
+    train_trial_ids = set(unique_trials) - val_trial_ids
+
+    # Build segments once, then filter per split
     N = len(df)
-    val_len = int(math.floor(N * config["val_split"]))
-    train_end = max(0, N - val_len)
-    train_start = 0
-    val_start = train_end
-    val_end = N
+    all_segments = compute_trial_segments(trials_arr, 0, N)
+    train_segments = filter_segments_by_trials(all_segments, trials_arr, train_trial_ids)
+    val_segments = filter_segments_by_trials(all_segments, trials_arr, val_trial_ids)
 
     cfg = ChunkingConfig(window=config["window"], stride=config["stride"], drop_last=True)
 
+    # Determine number of train samples per epoch (default to stride-based count within train trials)
+    default_train_samples = count_stride_windows_in_segments(train_segments, window=config["window"], stride=config["stride"])
+    samples_per_epoch = config.get("train_samples_per_epoch") or default_train_samples
+
     # Datasets
-    train_ds = WrenchPoseChunkDataset(
-        df, config["wrench_cols"], config["pose_cols"], config["label_cols"], cfg, mu, sd, start=train_start, end=train_end
+    train_ds = RandomWrenchPoseChunkDataset(
+        df,
+        config["wrench_cols"],
+        config["pose_cols"],
+        config["label_cols"],
+        window=config["window"],
+        wrench_norm_mu=mu,
+        wrench_norm_sd=sd,
+        start=0,
+        end=N,
+        trial_col=trial_col,
+        samples_per_epoch=int(samples_per_epoch),
+        rng=np.random.default_rng(config["seed"]),
+        allowed_trials=train_trial_ids,
     )
     val_ds = WrenchPoseChunkDataset(
-        df, config["wrench_cols"], config["pose_cols"], config["label_cols"], cfg, mu, sd, start=val_start, end=val_end
+        df,
+        config["wrench_cols"],
+        config["pose_cols"],
+        config["label_cols"],
+        cfg,
+        mu,
+        sd,
+        start=0,
+        end=N,
+        trial_col=trial_col,
+        allowed_trials=val_trial_ids,
     )
 
     if len(train_ds) == 0 or len(val_ds) == 0:
@@ -497,7 +642,8 @@ def main():
             f"Insufficient data after chunking. Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}. Try reducing window or val_split."
         )
 
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, drop_last=True)
+    # For random dataset, shuffling isn't necessary; each __getitem__ draws a fresh random chunk.
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, drop_last=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -525,8 +671,11 @@ def main():
         else:
             print("Starting training from scratch")
 
-    print(f"Train chunks: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}")
-    print(f"Input features: 12 (6 wrench + 6 relative pose)")
+    print(
+        f"Train trials: {len(train_trial_ids)} | Val trials: {len(val_trial_ids)} | "
+        f"Train chunks/epoch: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}"
+    )
+    print(f"Input features: 12 (6 wrench + 6 relative pose) | window={config['window']} (fixed), random-chunk training enabled")
 
     for epoch in range(start_epoch, config["epochs"] + 1):
         tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)

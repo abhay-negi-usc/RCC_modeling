@@ -54,13 +54,13 @@ df['FK_C'] = ee_poses[:,5]
 tf_E_RE = np.array([
     [1, 0, 0, 0],
     [0, 1, 0, 0],
-    [0, 0, 1, 76],  
+    [0, 0, 1, 68.4],  
     [0, 0, 0, 1]], dtype=float).reshape(1,4,4)
 
 tf_E_RP = np.array([
     [1, 0, 0, 0],
     [0, 1, 0, 0],
-    [0, 0, 1, 114],  
+    [0, 0, 1, 107.4],  
     [0, 0, 0, 1]], dtype=float).reshape(1,4,4)
 
 # compute poses with respect to zero frame 

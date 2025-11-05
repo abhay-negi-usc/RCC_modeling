@@ -10,7 +10,10 @@ from utils import z_rotation_matrix, kuka_fk, kuka_fk_batch, transform_wrench_re
 # open log data 
 # data_path = "./data/RCC_mounted_data_2013-01-08_23-21-43.csv" # isolated z rotation trial 
 # data_path = "./data/RCC_mounted_data_2013-01-08_11-04-47.csv" # full motion trial
-data_path = "./data/RCC_combined_14.csv" # 14 combined trials 
+# data_path = "./data/RCC_combined_14.csv" # 14 combined trials 
+# data_path = "./data/RCC_compliance_data_collection_2013-01-01_17-46-21.csv"
+data_path = "./data/RCC_kuka_15_trials.csv"
+
 df = pd.read_csv(data_path) 
 df = df.rename(columns={
     'axisQMsr_LBR_iiwa_14_R820_1[0]': 'J0',
@@ -21,6 +24,13 @@ df = df.rename(columns={
     'axisQMsr_LBR_iiwa_14_R820_1[5]': 'J5',
     'axisQMsr_LBR_iiwa_14_R820_1[6]': 'J6',    
 })
+
+# Compute relative time in seconds (first timestamp = 0)
+# Uses columns 'ZeitInSec' and 'ZeitInNanoSec'
+# Absolute time in seconds as float
+_t_abs_sec = df['ZeitInSec'].astype(np.int64) + df['ZeitInNanoSec'].astype(np.int64) * 1e-9
+# Relative time
+time_rel_sec = _t_abs_sec - _t_abs_sec.iloc[0]
 
 # run forward kinematics to get position 
 joint_positions = df[['J0', 'J1', 'J2', 'J3', 'J4', 'J5', 'J6']].values.astype(np.float32) * np.pi / 180.0
@@ -96,59 +106,62 @@ df_wrench_RE = pd.DataFrame(wrench_RE, columns=['FX', 'FY', 'FZ', 'TX', 'TY', 'T
 # plt.tight_layout()
 # plt.show()
 
-# scatterplot wrench vs pose components
-labels = ['X', 'Y', 'Z', 'A', 'B', 'C']
-wrench_labels = ['FX', 'FY', 'FZ', 'TX', 'TY', 'TZ']
-fig, axs = plt.subplots(6, 6, figsize=(20, 20))
-for i in range(6):
-    for j in range(6):
-        axs[i, j].scatter(pose_RE0_RE[:,i], df_wrench_RE.iloc[:,j], s=1, alpha=0.1)
-        axs[i, j].set_xlabel(labels[i])
-        axs[i, j].set_ylabel(wrench_labels[j])
-plt.tight_layout()
-plt.show()
+# # scatterplot wrench vs pose components
+# labels = ['X', 'Y', 'Z', 'A', 'B', 'C']
+# wrench_labels = ['FX', 'FY', 'FZ', 'TX', 'TY', 'TZ']
+# fig, axs = plt.subplots(6, 6, figsize=(20, 20))
+# for i in range(6):
+#     for j in range(6):
+#         axs[i, j].scatter(pose_RE0_RE[:,i], df_wrench_RE.iloc[:,j], s=1, alpha=0.1)
+#         axs[i, j].set_xlabel(labels[i])
+#         axs[i, j].set_ylabel(wrench_labels[j])
+# plt.tight_layout()
+# plt.show()
 
-# 4x3 timeseries plot of pose vs time and wrench vs time with synced x-axis
-fig, axs = plt.subplots(4, 3, figsize=(15, 15), sharex=True)
-for i in range(6):
-    row = i // 3
-    col = i % 3
-    axs[row, col].plot(pose_RE0_RE[:,i], label='Pose RE0 to RE')
-    axs[row, col].set_title(labels[i])
-    axs[row, col].set_ylabel(labels[i])
-    axs[row, col].legend()
-for i in range(6):
-    row = (i + 6) // 3
-    col = (i + 6) % 3
-    axs[row, col].plot(df_wrench_RE.iloc[:,i], label='Wrench RCC-End Effector Side Frame', color='orange')
-    axs[row, col].set_title(wrench_labels[i])
-    axs[row, col].set_ylabel(wrench_labels[i])
-    axs[row, col].legend()
+# # 4x3 timeseries plot of pose vs time and wrench vs time with synced x-axis
+# fig, axs = plt.subplots(4, 3, figsize=(15, 15), sharex=True)
+# for i in range(6):
+#     row = i // 3
+#     col = i % 3
+#     axs[row, col].plot(pose_RE0_RE[:,i], label='Pose RE0 to RE')
+#     axs[row, col].set_title(labels[i])
+#     axs[row, col].set_ylabel(labels[i])
+#     axs[row, col].legend()
+# for i in range(6):
+#     row = (i + 6) // 3
+#     col = (i + 6) % 3
+#     axs[row, col].plot(df_wrench_RE.iloc[:,i], label='Wrench RCC-End Effector Side Frame', color='orange')
+#     axs[row, col].set_title(wrench_labels[i])
+#     axs[row, col].set_ylabel(wrench_labels[i])
+#     axs[row, col].legend()
 
-# Add x-axis label only to the bottom row
-for col in range(3):
-    axs[3, col].set_xlabel('Time step')
+# # Add x-axis label only to the bottom row
+# for col in range(3):
+#     axs[3, col].set_xlabel('Time step')
 
-plt.tight_layout()
-plt.show()
+# plt.tight_layout()
+# plt.show()
 
-# coplot timeseries TZ vs A 
-fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-axs[0].plot(pose_RE0_RE[:,5], label='Orientation C (Z)')
-axs[0].set_title('Orientation C (Z)')
-axs[0].set_ylabel('Degrees')
-axs[0].legend()
-axs[1].plot(df_wrench_RE['TZ'], label='Torque Z', color='orange')
-axs[1].set_title('Torque Z')
-axs[1].set_xlabel('Time step')
-axs[1].set_ylabel('Nm')
-axs[1].legend()
-plt.tight_layout()
-plt.show()
+# # coplot timeseries TZ vs A 
+# fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+# axs[0].plot(pose_RE0_RE[:,5], label='Orientation C (Z)')
+# axs[0].set_title('Orientation C (Z)')
+# axs[0].set_ylabel('Degrees')
+# axs[0].legend()
+# axs[1].plot(df_wrench_RE['TZ'], label='Torque Z', color='orange')
+# axs[1].set_title('Torque Z')
+# axs[1].set_xlabel('Time step')
+# axs[1].set_ylabel('Nm')
+# axs[1].legend()
+# plt.tight_layout()
+# plt.show()
 
 # make a new df of pose_RE0_RE and wrench_RE and save to csv 
 df_processed = pd.DataFrame(pose_RE0_RE, columns=['X', 'Y', 'Z', 'A', 'B', 'C'])
 df_processed[['FX', 'FY', 'FZ', 'TX', 'TY', 'TZ']] = df_wrench_RE[['FX', 'FY', 'FZ', 'TX', 'TY', 'TZ']]
+# Add trial number and relative time in seconds as the first columns
+df_processed.insert(0, 'trial', df['trial'].values)
+df_processed.insert(1, 'time_sec', time_rel_sec.values)
 
 # data labeling 
 # compute normalized pose values ranging from -1 to +1 based on standard deviation 
@@ -223,4 +236,4 @@ for label in ['X', 'Y', 'Z', 'A', 'B', 'C']:
 output_path = os.path.splitext(data_path)[0] + "_processed.csv"
 df_processed.to_csv(output_path, index=False)   
 
-import pdb; pdb.set_trace()
+# import pdb; pdb.set_trace()

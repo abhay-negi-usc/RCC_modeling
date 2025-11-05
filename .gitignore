@@ -3,3 +3,5 @@ data
 *wandb*
 __pycache__
 ./regression_transformer_model/checkpoints
+FTS/data 
+ablation 

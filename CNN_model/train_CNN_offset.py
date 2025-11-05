@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Train a **Time-Series CNN (Temporal ConvNet/TCN)** to REGRESS EACH TIMESTEP of a
+Train a **Time-Series CNN (Temporal ConvNet/TCN)** to REGRESS THE FIRST-TIMESTEP POSE of a
 wrench+relative-pose time-series chunk into a 6D continuous vector
-(X_norm, Y_norm, Z_norm, A_norm, B_norm, C_norm) — i.e., output a value for
-every timestep and each of the 6 dimensions.
+(X_norm, Y_norm, Z_norm, A_norm, B_norm, C_norm) — i.e., output a single 6D vector
+for each chunk corresponding to the first timestep's target.
 
 This file is a drop-in replacement for the original Transformer script: it keeps
 identical data loading, chunking, normalization, logging, checkpoints, and
-metrics — only the model is changed to a TCN built from dilated causal/bidirectional
-conv1d residual blocks.
+metrics — only the target becomes the first timestep of the chunk, and the model
+head outputs a single 6D vector per chunk.
 
 Usage:
   python train_regression_tscnn.py
@@ -32,31 +32,30 @@ Requires: torch, pandas, numpy, wandb
 # - cnn_bidirectional: when True, uses symmetric (SAME) padding so each timestep can see past and future context
 #   (non-causal). A purely causal variant would use left-only padding; this implementation uses SAME padding.
 CONFIG = {
-    # "csv": "./data/RCC_combined_14_processed.csv",
-    "csv": "./data/RCC_kuka_ati_15_trials.csv",
-    # "wrench_cols": ["FX", "FY", "FZ", "TX", "TY", "TZ"],
-    "wrench_cols": ["Fx_ati", "Fy_ati", "Fz_ati", "Tx_ati", "Ty_ati", "Tz_ati"],
+    "csv": "./data/RCC_combined_14_processed.csv",
+    "wrench_cols": ["FX", "FY", "FZ", "TX", "TY", "TZ"],
     "pose_cols": ["X", "Y", "Z", "A", "B", "C"],
     "label_cols": ["X_norm", "Y_norm", "Z_norm", "A_norm", "B_norm", "C_norm"],
-    "window": 2048,
-    "stride": 512,
-    "batch_size": 64,
+    "window": 512,
+    "stride": 64,
+    "batch_size": 256,
     "epochs": 1_000_000,
-    "lr": 1e-3,
+    "lr": 1e-4,
     "val_split": 0.2,
     "seed": 42,
 
     # CNN architecture (replaces Transformer params)
-    "cnn_hidden": 128,            # base channels per residual block
-    "cnn_layers": 6,              # number of residual blocks (controls depth and receptive field)
+    "cnn_hidden": 64,            # base channels per residual block
+    "cnn_layers": 2,              # number of residual blocks (controls depth and receptive field)
     "cnn_kernel": 7,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
-    "cnn_dilation_base": 2,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
-    "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
+    "cnn_dilation_base": 4,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
+    "cnn_bidirectional": False,    # SAME padding (non-causal); uses future context in addition to past
 
-    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints/",
+    # Changed output directory to differentiate from original script
+    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_first_pose/",
     "save_every": 100,
-    "wandb_project": "rcc_regression_cnn",
+    "wandb_project": "rcc_offset_cnn",
     "wandb_name": None,
     "continue_from": None,        # "best", "latest", path, or None
 
@@ -159,8 +158,9 @@ class WrenchPoseChunkDataset(Dataset):
         pose_chunk = self.pose[s:e, :]                  # (T, 6) absolute
         rel_pose_chunk = compute_relative_pose(pose_chunk)  # (T, 6)
         x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)  # (T, 12)
-        targets_Tx6 = self.labels[s:e, :].astype(np.float32)  # (T, 6)
-        return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
+        # Target is the FIRST timestep's label of the chunk -> 6D vector
+        first_timestep_target = self.labels[s, :].astype(np.float32)  # (6,)
+        return torch.from_numpy(x), torch.from_numpy(first_timestep_target)
 
 # ----------------------------
 # Time-Series CNN (TCN)
@@ -210,8 +210,9 @@ class TimeSeriesCNN(nn.Module):
             in_ch = ch
         self.tcn = nn.Sequential(*blocks)
 
+        # Head now predicts a single 6D vector per chunk using the first timestep representation
         self.head_norm = nn.LayerNorm(hidden)
-        self.head = nn.Conv1d(hidden, num_tasks, kernel_size=1)
+        self.head = nn.Linear(hidden, num_tasks)
 
     def forward(self, x):  # x: [B, T, 12]
         # Conv1d expects [B, C, T]
@@ -221,9 +222,9 @@ class TimeSeriesCNN(nn.Module):
         # LayerNorm over channel: move to [B, T, H]
         h_ln = h.transpose(1, 2)  # [B, T, H]
         h_ln = self.head_norm(h_ln)
-        h = h_ln.transpose(1, 2)  # [B, H, T]
-        y = self.head(h)          # [B, 6, T]
-        y = y.transpose(1, 2)     # [B, T, 6]
+        # Use representation at first timestep to predict first pose of the chunk
+        h0 = h_ln[:, 0, :]         # [B, H]
+        y = self.head(h0)          # [B, 6]
         return y
 
 # ----------------------------
@@ -269,15 +270,14 @@ def evaluate(model, loader, device, loss_fn):
     for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
-        preds = model(xb)
+        preds = model(xb)            # [B, 6]
         loss = loss_fn(preds, yb)
         total += float(loss.item())
         n += 1
-        diff = preds - yb
-        B, T, D = diff.shape
-        mae_sum += diff.abs().sum(dim=(0, 1))
-        mse_sum += (diff ** 2).sum(dim=(0, 1))
-        count += B * T
+        diff = preds - yb            # [B, 6]
+        mae_sum += diff.abs().sum(dim=0)
+        mse_sum += (diff ** 2).sum(dim=0)
+        count += diff.shape[0]       # B
 
     avg_loss = total / max(n, 1)
     mae_per_dim = (mae_sum / max(count, 1)).detach().cpu().tolist()
@@ -303,14 +303,14 @@ def evaluate_and_save_predictions(model, loader, device, output_path):
     for xb, yb in loader:
         xb = xb.to(device)
         yb = yb.to(device)
-        B, T, _ = yb.shape
-        preds = model(xb)
+        preds = model(xb)  # [B, 6]
         loss = loss_fn(preds, yb)
 
-        all_predictions.append(preds.detach().cpu().numpy().reshape(-1, 6))
-        all_ground_truth.append(yb.detach().cpu().numpy().reshape(-1, 6))
-        chunk_ids = np.repeat(np.arange(chunk_offset, chunk_offset + B), T)
-        t_ids = np.tile(np.arange(T), B)
+        all_predictions.append(preds.detach().cpu().numpy())           # [B, 6]
+        all_ground_truth.append(yb.detach().cpu().numpy())             # [B, 6]
+        B = preds.shape[0]
+        chunk_ids = np.arange(chunk_offset, chunk_offset + B)
+        t_ids = np.zeros(B, dtype=int)  # first timestep per chunk
         all_chunk_ids.append(chunk_ids)
         all_t_ids.append(t_ids)
         chunk_offset += B
@@ -355,48 +355,82 @@ def map_norm_to_class(values: np.ndarray, boundaries=(0.5, 0.75)) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5, 0.75)):
+    """Evaluate classification over ALL timesteps by offsetting each chunk's normalized
+    relative pose with the predicted first pose.
+
+    For a chunk starting at index s with window T:
+      - y_pred (B,6) is the predicted normalized first pose at t=0.
+      - labels_norm[s:e,:] provides ground-truth normalized pose for all timesteps.
+      - rel_norm = labels_norm[s:e,:] - labels_norm[s,:] is the normalized relative pose per timestep.
+      - pred_chunk_norm = y_pred + rel_norm gives predicted normalized pose for all timesteps.
+
+    We then map pred_chunk_norm and labels_norm[s:e,:] to classes and compute accuracy and a confusion matrix.
+    """
     model.eval()
-    preds_list = []
-    gts_list = []
+
+    ds = loader.dataset
+    if not hasattr(ds, "labels") or not hasattr(ds, "indices"):
+        raise RuntimeError("Dataset must expose 'labels' and 'indices' for classification evaluation.")
+
+    num_classes = 5
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    correct_per_dim = np.zeros(6, dtype=np.int64)
+    total_per_dim = np.zeros(6, dtype=np.int64)
+
+    sample_start_idx = 0  # tracks position within ds.indices for the current batch
+
     for xb, yb in loader:
         xb = xb.to(device)
-        yb = yb.to(device)
-        pred = model(xb)
-        preds_list.append(pred.detach().cpu().numpy())
-        gts_list.append(yb.detach().cpu().numpy())
+        yb = yb.to(device)  # [B, 6] true first pose (normalized)
+        pred_first = model(xb).detach().cpu().numpy()  # [B, 6]
 
-    if not preds_list:
+        B = pred_first.shape[0]
+        # Determine which dataset indices correspond to this batch (shuffle=False for val loader)
+        batch_indices = ds.indices[sample_start_idx: sample_start_idx + B]
+        sample_start_idx += B
+
+        for b, s in enumerate(batch_indices):
+            e = s + ds.cfg.window
+            # Ground-truth normalized pose for whole chunk [T,6]
+            gt_chunk_norm = ds.labels[s:e, :]
+            if gt_chunk_norm.shape[0] == 0:
+                continue
+            # Normalized relative pose per timestep w.r.t. first timestep
+            rel_norm = gt_chunk_norm - gt_chunk_norm[0:1, :]
+            # Predicted normalized pose for whole chunk using predicted first pose
+            pred_chunk_norm = pred_first[b:b+1, :] + rel_norm  # [T,6]
+
+            # Map to classes
+            pred_c = map_norm_to_class(pred_chunk_norm, boundaries).reshape(-1, 6)
+            gt_c = map_norm_to_class(gt_chunk_norm, boundaries).reshape(-1, 6)
+
+            # Update per-dimension accuracy counts
+            for d in range(6):
+                eq = (pred_c[:, d] == gt_c[:, d])
+                correct_per_dim[d] += int(eq.sum())
+                total_per_dim[d] += int(eq.shape[0])
+
+            # Update confusion matrix aggregated over all dimensions/timesteps
+            pred_all = pred_c.reshape(-1)
+            gt_all = gt_c.reshape(-1)
+            for t, p in zip(gt_all, pred_all):
+                if 0 <= t < num_classes and 0 <= p < num_classes:
+                    cm[int(t), int(p)] += 1
+
+    if total_per_dim.sum() == 0:
         import numpy as _np
         return 0.0, [0.0]*6, _np.zeros((5,5), dtype=_np.int64), os.path.join(out_dir, "confusion_matrix.png")
 
-    preds = np.concatenate(preds_list, axis=0)
-    gts = np.concatenate(gts_list, axis=0)
-
-    P = preds.reshape(-1, 6)
-    G = gts.reshape(-1, 6)
-
-    acc_per_dim = []
-    for d in range(6):
-        pred_c = map_norm_to_class(P[:, d], boundaries)
-        gt_c = map_norm_to_class(G[:, d], boundaries)
-        acc = float((pred_c == gt_c).mean())
-        acc_per_dim.append(acc)
+    acc_per_dim = (correct_per_dim / np.maximum(total_per_dim, 1)).astype(float).tolist()
     mean_acc = float(np.mean(acc_per_dim))
 
-    pred_all = map_norm_to_class(P, boundaries).reshape(-1)
-    gt_all = map_norm_to_class(G, boundaries).reshape(-1)
-    num_classes = 5
-    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
-    for t, p in zip(gt_all, pred_all):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            cm[int(t), int(p)] += 1
-
+    # Plot and save confusion matrix
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm, cmap="Blues")
-    ax.set_title("Validation Confusion Matrix (Aggregated)")
+    ax.set_title("Validation Confusion Matrix (Pred-first offset over T)")
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
     ax.set_xticks(range(num_classes))
@@ -461,7 +495,7 @@ def main():
 
     os.makedirs(config["out_dir"], exist_ok=True)
 
-    wandb_name = config["wandb_name"] or f"rcc_tscnn_regression_{config['window']}w_{config['stride']}s"
+    wandb_name = config["wandb_name"] or f"rcc_tscnn_regression_{config['window']}w_{config['stride']}s_first_pose"
     wandb.init(project=config["wandb_project"], name=wandb_name, config=config)
 
     # Load CSV

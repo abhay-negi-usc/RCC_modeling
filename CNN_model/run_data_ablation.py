@@ -8,6 +8,10 @@ scale with the amount of training data used. It uses the same dataset loading,
 chunking, normalization, and model definition from train_CNN.py, and keeps the
 validation set fixed across all runs.
 
+Key compatibility updates with train_CNN.py:
+- Uses trial-aware train/val split by unique `trial_col` values (no cross-trial leakage)
+- Builds datasets using the updated WrenchPoseChunkDataset signature (requires trial_col and allowed_trials)
+
 For each requested training fraction, it samples that fraction of training
 chunks (with a fixed seed for reproducibility), trains for a limited number of
 epochs, and records the best validation loss and best validation classification
@@ -32,7 +36,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -63,20 +67,35 @@ def set_seeds(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_datasets(df: pd.DataFrame, cfg: dict) -> Tuple[WrenchPoseChunkDataset, WrenchPoseChunkDataset, Tuple[np.ndarray, np.ndarray]]:
+def compute_trial_splits(df: pd.DataFrame, cfg: dict, seed: int) -> Tuple[Set, Set]:
+    """Create train/val trial ID sets using the same approach as train_CNN.py."""
+    trial_col = cfg["trial_col"]
+    if trial_col not in df.columns:
+        raise ValueError(f"Trial column '{trial_col}' not found in CSV. Columns: {list(df.columns)}")
+    trials_arr = df[trial_col].values
+    unique_trials = pd.unique(trials_arr)  # preserves order of appearance
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(unique_trials))
+    n_val_trials = max(1, int(math.ceil(len(unique_trials) * cfg["val_split"])))
+    val_trial_ids = set(unique_trials[perm[:n_val_trials]])
+    train_trial_ids = set(unique_trials) - val_trial_ids
+    return train_trial_ids, val_trial_ids
+
+
+def build_datasets(
+    df: pd.DataFrame,
+    cfg: dict,
+    train_trial_ids: Set,
+    val_trial_ids: Set,
+) -> Tuple[WrenchPoseChunkDataset, WrenchPoseChunkDataset, Tuple[np.ndarray, np.ndarray]]:
     # Fit normalization on the whole file (consistent with train_CNN.py)
     wrench_all = df[cfg["wrench_cols"]].values.astype(np.float32)
     mu, sd = zscore_fit(wrench_all)
 
-    # Time-preserving split indices
-    N = len(df)
-    val_len = int(math.floor(N * cfg["val_split"]))
-    train_end = max(0, N - val_len)
-    train_start = 0
-    val_start = train_end
-    val_end = N
-
     chunk_cfg = ChunkingConfig(window=cfg["window"], stride=cfg["stride"], drop_last=True)
+
+    N = len(df)
+    trial_col = cfg["trial_col"]
 
     train_ds = WrenchPoseChunkDataset(
         df,
@@ -86,8 +105,10 @@ def build_datasets(df: pd.DataFrame, cfg: dict) -> Tuple[WrenchPoseChunkDataset,
         chunk_cfg,
         mu,
         sd,
-        start=train_start,
-        end=train_end,
+        start=0,
+        end=N,
+        trial_col=trial_col,
+        allowed_trials=train_trial_ids,
     )
     val_ds = WrenchPoseChunkDataset(
         df,
@@ -97,8 +118,10 @@ def build_datasets(df: pd.DataFrame, cfg: dict) -> Tuple[WrenchPoseChunkDataset,
         chunk_cfg,
         mu,
         sd,
-        start=val_start,
-        end=val_end,
+        start=0,
+        end=N,
+        trial_col=trial_col,
+        allowed_trials=val_trial_ids,
     )
 
     return train_ds, val_ds, (mu, sd)
@@ -118,17 +141,23 @@ def run_one_fraction(
     seed: int,
     eval_every: int = 5,
     patience: int = 0,
+    train_trial_ids: Set | None = None,
+    val_trial_ids: Set | None = None,
 ):
     """Train a model using a fraction of training chunks and return metrics."""
     set_seeds(seed + repeat_idx)
 
-    train_ds, val_ds, _ = build_datasets(df, base_cfg)
+    if train_trial_ids is None or val_trial_ids is None:
+        # Fallback: compute splits deterministically from base seed
+        train_trial_ids, val_trial_ids = compute_trial_splits(df, base_cfg, seed)
+
+    train_ds, val_ds, _ = build_datasets(df, base_cfg, train_trial_ids, val_trial_ids)
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError(
             f"Insufficient data after chunking. Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}"
         )
 
-    # Determine subset size by fraction of chunks
+    # Determine subset size by fraction of chunks (stride-based chunks within train trials)
     total_chunks = len(train_ds)
     k = max(1, int(round(fraction * total_chunks)))
     # Build stable index list in [0, total_chunks)
@@ -232,7 +261,7 @@ def main():
         "--fractions",
         type=float,
         nargs="+",
-        default=[0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
+        default=[0.1, 0.2, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
         help="Fractions of training chunks to use",
     )
     parser.add_argument("--repeats", type=int, default=1, help="Number of repeats per fraction")
@@ -262,6 +291,11 @@ def main():
     for c in cfg["wrench_cols"] + cfg["pose_cols"] + cfg["label_cols"]:
         if c not in df.columns:
             raise ValueError(f"Column '{c}' not found in CSV. Available: {list(df.columns)}")
+    if cfg.get("trial_col") not in df.columns:
+        raise ValueError(f"Trial column '{cfg.get('trial_col')}' not found in CSV. Columns: {list(df.columns)}")
+
+    # Trial-aware split (fixed across all runs/repeats)
+    train_trial_ids, val_trial_ids = compute_trial_splits(df, cfg, args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -272,6 +306,7 @@ def main():
     print(
         f"Will run ablation for fractions={fractions}, repeats={args.repeats}, epochs={args.epochs}, batch_size={args.batch_size}"
     )
+    print(f"Train trials: {len(train_trial_ids)} | Val trials: {len(val_trial_ids)}")
 
     for f in fractions:
         for r in range(args.repeats):
@@ -290,6 +325,8 @@ def main():
                 seed=args.seed,
                 eval_every=args.eval_every,
                 patience=args.patience,
+                train_trial_ids=train_trial_ids,
+                val_trial_ids=val_trial_ids,
             )
             print(
                 "Result:",

@@ -40,8 +40,8 @@ CONFIG = {
     "label_cols": ["X_norm", "Y_norm", "Z_norm", "A_norm", "B_norm", "C_norm"],
     "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
     "window": 8192,
-    "stride": 1024,
-    "batch_size": 128,
+    "stride": 8192,
+    "batch_size": 64,
     "epochs": 1_000_000,
     "lr": 1e-4,
     "val_split": 0.2,
@@ -49,22 +49,22 @@ CONFIG = {
 
     # CNN architecture (replaces Transformer params)
     "cnn_hidden": 64,            # base channels per residual block
-    "cnn_layers": 6,              # number of residual blocks (controls depth and receptive field)
-    "cnn_kernel": 5,              # odd kernel for SAME-length convolution
+    "cnn_layers": 16,              # number of residual blocks (controls depth and receptive field)
+    "cnn_kernel": 11,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
     "cnn_dilation_base": 2,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
-    "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
+    "cnn_bidirectional": False,    # SAME padding (non-causal); uses future context in addition to past
 
     # Random-chunk training
     # Number of randomly sampled, fixed-length train chunks per epoch. If None, defaults to the
     # number of stride-based windows that fit within each trial in the training split (for similar epoch size).
-    "train_samples_per_epoch": None,
+    "train_samples_per_epoch": 100_000,
 
-    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints/",
+    "out_dir": "/home/nom4d/RCC_modeling/CNN_model/checkpoints/",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,
-    "continue_from": None,        # "best", "latest", path, or None
+    "continue_from": "best",        # "best", "latest", path, or None
 
     # Regression loss
     "loss": "huber",      # "huber" or "mse"

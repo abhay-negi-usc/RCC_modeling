@@ -41,7 +41,7 @@ CONFIG = {
     "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
     "window": 8192,
     "stride": 8192,
-    "batch_size": 64,
+    "batch_size": 32,
     "epochs": 1_000_000,
     "lr": 1e-4,
     "val_split": 0.2,
@@ -58,9 +58,9 @@ CONFIG = {
     # Random-chunk training
     # Number of randomly sampled, fixed-length train chunks per epoch. If None, defaults to the
     # number of stride-based windows that fit within each trial in the training split (for similar epoch size).
-    "train_samples_per_epoch": 100_000,
+    "train_samples_per_epoch": 10_000,
 
-    "out_dir": "/home/nom4d/RCC_modeling/CNN_model/checkpoints/",
+    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,
@@ -461,6 +461,10 @@ def map_norm_to_class(values: np.ndarray, boundaries=(0.5, 0.75)) -> np.ndarray:
     classes[v >= b1] = 4
     return classes
 
+# New helper to collapse 5-class labels to 3-class
+def collapse_to_3class(c5: np.ndarray) -> np.ndarray:
+    return np.where(c5 == 2, 1, np.where(np.isin(c5, [3, 4]), 2, 0))
+
 
 @torch.no_grad()
 def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5, 0.75)):
@@ -475,8 +479,8 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
         gts_list.append(yb.detach().cpu().numpy())
 
     if not preds_list:
-        import numpy as _np
-        return 0.0, [0.0]*6, _np.zeros((5,5), dtype=_np.int64), os.path.join(out_dir, "confusion_matrix.png")
+        empty_cm5_path = os.path.join(out_dir, "confusion_matrix.png")
+        return 0.0, [0.0]*6, np.zeros((5, 5), dtype=np.int64), empty_cm5_path, 0.0, [0.0]*6, {}
 
     preds = np.concatenate(preds_list, axis=0)
     gts = np.concatenate(gts_list, axis=0)
@@ -485,23 +489,94 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     G = gts.reshape(-1, 6)
 
     acc_per_dim = []
-    for d in range(6):
-        pred_c = map_norm_to_class(P[:, d], boundaries)
-        gt_c = map_norm_to_class(G[:, d], boundaries)
-        acc = float((pred_c == gt_c).mean())
-        acc_per_dim.append(acc)
-    mean_acc = float(np.mean(acc_per_dim))
+    acc3_per_dim = []
+    dim_labels = ["X", "Y", "Z", "A", "B", "C"]
+    per_dim_plot_paths = {lbl: {} for lbl in dim_labels}
 
+    for d, lbl in enumerate(dim_labels):
+        pred_c5 = map_norm_to_class(P[:, d], boundaries)
+        gt_c5 = map_norm_to_class(G[:, d], boundaries)
+        acc = float((pred_c5 == gt_c5).mean())
+        acc_per_dim.append(acc)
+        pred_c3 = collapse_to_3class(pred_c5)
+        gt_c3 = collapse_to_3class(gt_c5)
+        acc3 = float((pred_c3 == gt_c3).mean())
+        acc3_per_dim.append(acc3)
+
+        num_c3 = 3
+        cm3 = np.zeros((num_c3, num_c3), dtype=np.int64)
+        for t, p in zip(gt_c3, pred_c3):
+            cm3[t, p] += 1
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        # 3-class confusion matrix heatmap
+        fig_cm, ax_cm = plt.subplots(figsize=(5, 4))
+        im = ax_cm.imshow(cm3, cmap="Blues")
+        ax_cm.set_title(f"3-Class Confusion ({lbl})")
+        ax_cm.set_xlabel("Predicted")
+        ax_cm.set_ylabel("True")
+        ax_cm.set_xticks(range(num_c3), ["Neg", "Neu", "Pos"])
+        ax_cm.set_yticks(range(num_c3), ["Neg", "Neu", "Pos"])
+        for i in range(num_c3):
+            for j in range(num_c3):
+                ax_cm.text(j, i, cm3[i, j], ha="center", va="center", color="black", fontsize=8)
+        fig_cm.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+        fig_cm.tight_layout()
+        cm3_path = os.path.join(out_dir, f"confusion_matrix_3class_dim_{lbl}.png")
+        fig_cm.savefig(cm3_path, dpi=150)
+        plt.close(fig_cm)
+        per_dim_plot_paths[lbl]["cm3"] = cm3_path
+
+        # FP / FN bar chart
+        fp = np.zeros(num_c3, dtype=np.int64)
+        fn = np.zeros(num_c3, dtype=np.int64)
+        for k in range(num_c3):
+            tp_k = cm3[k, k]
+            fn[k] = cm3[k, :].sum() - tp_k
+            fp[k] = cm3[:, k].sum() - tp_k
+        x = np.arange(num_c3)
+        width = 0.35
+        fig_b, ax_b = plt.subplots(figsize=(5, 4))
+        ax_b.bar(x - width/2, fp, width, label="FP", color="#e57373")
+        ax_b.bar(x + width/2, fn, width, label="FN", color="#64b5f6")
+        ax_b.set_title(f"3-Class FP/FN ({lbl})")
+        ax_b.set_xticks(x, ["Neg", "Neu", "Pos"])
+        ax_b.set_ylabel("Count")
+        ax_b.legend()
+        fig_b.tight_layout()
+        fpfn_path = os.path.join(out_dir, f"fp_fn_bar_3class_dim_{lbl}.png")
+        fig_b.savefig(fpfn_path, dpi=150)
+        plt.close(fig_b)
+        per_dim_plot_paths[lbl]["fpfn"] = fpfn_path
+
+        # Per-class accuracy bar chart
+        per_class_den = cm3.sum(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            per_class_acc = np.where(per_class_den > 0, np.diag(cm3) / per_class_den, 0.0)
+        fig_a, ax_a = plt.subplots(figsize=(5, 4))
+        ax_a.bar(["Neg", "Neu", "Pos"], per_class_acc, color="#81c784")
+        ax_a.set_ylim(0, 1)
+        ax_a.set_title(f"3-Class Per-Class Acc ({lbl})")
+        ax_a.set_ylabel("Accuracy")
+        fig_a.tight_layout()
+        accbar_path = os.path.join(out_dir, f"per_class_acc_3class_dim_{lbl}.png")
+        fig_a.savefig(accbar_path, dpi=150)
+        plt.close(fig_a)
+        per_dim_plot_paths[lbl]["accbar"] = accbar_path
+
+    mean_acc = float(np.mean(acc_per_dim))
+    mean_acc3 = float(np.mean(acc3_per_dim))
+
+    # Aggregated 5-class confusion matrix (unchanged logic)
     pred_all = map_norm_to_class(P, boundaries).reshape(-1)
     gt_all = map_norm_to_class(G, boundaries).reshape(-1)
     num_classes = 5
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     for t, p in zip(gt_all, pred_all):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            cm[int(t), int(p)] += 1
+        cm[t, p] += 1
 
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm, cmap="Blues")
@@ -516,11 +591,10 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig_path = os.path.join(out_dir, "confusion_matrix.png")
-    plt.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=150)
     plt.close(fig)
 
-    return mean_acc, acc_per_dim, cm, fig_path
-
+    return mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths
 # ----------------------------
 # Checkpoint utilities
 # ----------------------------
@@ -692,15 +766,25 @@ def main():
         })
 
         if (epoch % int(config.get("classify_every", 5))) == 0:
-            mean_acc, acc_per_dim, cm, fig_path = evaluate_classification(
+            mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths = evaluate_classification(
                 model, val_loader, device, config["out_dir"], tuple(config.get("class_boundaries", [0.5, 0.75]))
             )
-            print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]}")
-            wandb.log({
+            print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]} | 3-class_mean_acc={mean_acc3:.4f}")
+            log_payload = {
                 "val_class_mean_acc": mean_acc,
                 **{f"val_class_acc_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc_per_dim)},
-                "confusion_matrix_img": wandb.Image(fig_path)
-            })
+                "confusion_matrix_img": wandb.Image(fig_path),
+                "classification_accuracy_3class": mean_acc3,
+                **{f"val_class_acc_3class_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
+            }
+            for lbl, paths in per_dim_plot_paths.items():
+                if "cm3" in paths:
+                    log_payload[f"val_3class_confusion_{lbl}"] = wandb.Image(paths["cm3"])
+                if "fpfn" in paths:
+                    log_payload[f"val_3class_fpfn_{lbl}"] = wandb.Image(paths["fpfn"])
+                if "accbar" in paths:
+                    log_payload[f"val_3class_accbar_{lbl}"] = wandb.Image(paths["accbar"])
+            wandb.log(log_payload)
 
         is_best = vl_loss < best_val
         if is_best:

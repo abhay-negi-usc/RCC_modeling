@@ -41,16 +41,16 @@ CONFIG = {
     "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
     "window": 16384,
     "stride": 16384,
-    "batch_size": 32,
+    "batch_size": 16,
     "epochs": 1_000_000,
-    "lr": 1e-4,
+    "lr": 1e-3,
     "val_split": 0.2,
     "seed": 42,
     # NEW: enable per-epoch resampling of random training dataset
     "resample_train_each_epoch": True,
 
     # CNN architecture (replaces Transformer params)
-    "cnn_hidden": 24,            # base channels per residual block
+    "cnn_hidden": 36,            # base channels per residual block
     "cnn_layers": 24,              # number of residual blocks (controls depth and receptive field)
     "cnn_kernel": 11,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
@@ -60,22 +60,22 @@ CONFIG = {
     # Random-chunk training
     # Number of randomly sampled, fixed-length train chunks per epoch. If None, defaults to the
     # number of stride-based windows that fit within each trial in the training split (for similar epoch size).
-    "train_samples_per_epoch": 100,
+    "train_samples_per_epoch": 1_000,
 
     # "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
     "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v5",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,
-    "continue_from": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v2/best_model_regression (copy).pt",        # "best", "latest", path, or None
-    # "continue_from": None,        # "best", "latest", path, or None
+    # "continue_from": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v2/best_model_regression (copy).pt",        # "best", "latest", path, or None
+    "continue_from": None,        # "best", "latest", path, or None
 
     # Regression loss
     "loss": "huber",      # "huber" or "mse"
     "huber_delta": 1.0,
 
     # Classification-from-regression evaluation
-    "classify_every": 5,
+    "classify_every": 50,
     "class_boundaries": [0.5, 0.75],
 }
 

@@ -39,32 +39,36 @@ CONFIG = {
     "pose_cols": ["X", "Y", "Z", "A", "B", "C"],
     "label_cols": ["X_norm", "Y_norm", "Z_norm", "A_norm", "B_norm", "C_norm"],
     "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
-    "window": 8192,
-    "stride": 8192,
+    "window": 16384,
+    "stride": 16384,
     "batch_size": 32,
     "epochs": 1_000_000,
     "lr": 1e-4,
     "val_split": 0.2,
     "seed": 42,
+    # NEW: enable per-epoch resampling of random training dataset
+    "resample_train_each_epoch": True,
 
     # CNN architecture (replaces Transformer params)
-    "cnn_hidden": 64,            # base channels per residual block
-    "cnn_layers": 16,              # number of residual blocks (controls depth and receptive field)
+    "cnn_hidden": 24,            # base channels per residual block
+    "cnn_layers": 24,              # number of residual blocks (controls depth and receptive field)
     "cnn_kernel": 11,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
     "cnn_dilation_base": 2,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
-    "cnn_bidirectional": False,    # SAME padding (non-causal); uses future context in addition to past
+    "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
 
     # Random-chunk training
     # Number of randomly sampled, fixed-length train chunks per epoch. If None, defaults to the
     # number of stride-based windows that fit within each trial in the training split (for similar epoch size).
-    "train_samples_per_epoch": 10_000,
+    "train_samples_per_epoch": 100,
 
-    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
+    # "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
+    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v5",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,
-    "continue_from": "best",        # "best", "latest", path, or None
+    "continue_from": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v2/best_model_regression (copy).pt",        # "best", "latest", path, or None
+    # "continue_from": None,        # "best", "latest", path, or None
 
     # Regression loss
     "loss": "huber",      # "huber" or "mse"
@@ -480,7 +484,13 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
 
     if not preds_list:
         empty_cm5_path = os.path.join(out_dir, "confusion_matrix.png")
-        return 0.0, [0.0]*6, np.zeros((5, 5), dtype=np.int64), empty_cm5_path, 0.0, [0.0]*6, {}
+        # Added: empty overall detection metrics structure
+        empty_overall_fig_path = os.path.join(out_dir, "overall_limit_confusion_matrix.png")
+        return 0.0, [0.0]*6, np.zeros((5, 5), dtype=np.int64), empty_cm5_path, 0.0, [0.0]*6, {}, {
+            "TP": 0, "FP": 0, "TN": 0, "FN": 0,
+            "sensitivity": 0.0, "specificity": 0.0, "precision": 0.0, "npv": 0.0, "accuracy": 0.0,
+            "fig_path": empty_overall_fig_path
+        }
 
     preds = np.concatenate(preds_list, axis=0)
     gts = np.concatenate(gts_list, axis=0)
@@ -594,7 +604,68 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     fig.savefig(fig_path, dpi=150)
     plt.close(fig)
 
-    return mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths
+    # ----------------------------
+    # NEW: Overall limit detection confusion matrix & metrics
+    # Positive iff ANY dimension is non-neutral (class != 2). Negative iff ALL are neutral.
+    # ----------------------------
+    pred_c5_matrix = map_norm_to_class(P, boundaries)  # shape [N,6]
+    gt_c5_matrix = map_norm_to_class(G, boundaries)
+    gt_pos = (gt_c5_matrix != 2).any(axis=1)
+    pred_pos = (pred_c5_matrix != 2).any(axis=1)
+
+    TP = int(np.sum(pred_pos & gt_pos))
+    TN = int(np.sum(~pred_pos & ~gt_pos))
+    FP = int(np.sum(pred_pos & ~gt_pos))
+    FN = int(np.sum(~pred_pos & gt_pos))
+
+    def safe_div(a, b):
+        return float(a / b) if b > 0 else 0.0
+
+    sensitivity = safe_div(TP, TP + FN)        # recall
+    specificity = safe_div(TN, TN + FP)
+    precision = safe_div(TP, TP + FP)          # PPV
+    npv = safe_div(TN, TN + FN)                # NPV
+    accuracy = safe_div(TP + TN, TP + TN + FP + FN)
+
+    overall_cm = np.array([[TN, FP], [FN, TP]], dtype=np.int64)  # rows=true (Neg,Pos) cols=pred (Neg,Pos)
+
+    # Normalize confusion matrix by true class (row) sums
+    row_sums = overall_cm.sum(axis=1, keepdims=True)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        overall_cm_norm = np.where(row_sums > 0, overall_cm / row_sums, 0.0)
+
+    fig_overall, ax_overall = plt.subplots(figsize=(5,4))
+    im2 = ax_overall.imshow(overall_cm_norm, cmap="Purples", vmin=0.0, vmax=1.0)
+    ax_overall.set_title("Overall Limit Detection Confusion Matrix (Row-Normalized)")
+    ax_overall.set_xlabel("Predicted")
+    ax_overall.set_ylabel("True")
+    ax_overall.set_xticks([0,1],["Neg","Pos"])
+    ax_overall.set_yticks([0,1],["Neg","Pos"])
+    for i in range(2):
+        for j in range(2):
+            ax_overall.text(j, i, f"{overall_cm[i, j]}\n{overall_cm_norm[i, j]:.2f}", ha="center", va="center", color="black", fontsize=10)
+    fig_overall.colorbar(im2, ax=ax_overall, fraction=0.046, pad=0.04, label="Row-Normalized Value")
+    # Add metrics text box
+    metrics_str = (f"Sensitivity: {sensitivity:.3f}\nSpecificity: {specificity:.3f}\n"\
+                   f"Precision: {precision:.3f}\nNPV: {npv:.3f}\nAccuracy: {accuracy:.3f}")
+    ax_overall.text(1.05, 0.5, metrics_str, transform=ax_overall.transAxes, va="center", ha="left",
+                    fontsize=9, bbox=dict(boxstyle="round", facecolor="#f0f0f0", alpha=0.8))
+    fig_overall.tight_layout()
+    overall_fig_path = os.path.join(out_dir, "overall_limit_confusion_matrix.png")
+    fig_overall.savefig(overall_fig_path, dpi=150)
+    plt.close(fig_overall)
+
+    overall_metrics = {
+        "TP": TP, "FP": FP, "TN": TN, "FN": FN,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "precision": precision,
+        "npv": npv,
+        "accuracy": accuracy,
+        "fig_path": overall_fig_path,
+    }
+
+    return mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics
 # ----------------------------
 # Checkpoint utilities
 # ----------------------------
@@ -682,21 +753,25 @@ def main():
     samples_per_epoch = config.get("train_samples_per_epoch") or default_train_samples
 
     # Datasets
-    train_ds = RandomWrenchPoseChunkDataset(
-        df,
-        config["wrench_cols"],
-        config["pose_cols"],
-        config["label_cols"],
-        window=config["window"],
-        wrench_norm_mu=mu,
-        wrench_norm_sd=sd,
-        start=0,
-        end=N,
-        trial_col=trial_col,
-        samples_per_epoch=int(samples_per_epoch),
-        rng=np.random.default_rng(config["seed"]),
-        allowed_trials=train_trial_ids,
-    )
+    def build_random_train_ds(epoch_seed_offset: int = 0):
+        # Different RNG seed each epoch => different random sampling distribution of chunk starts.
+        return RandomWrenchPoseChunkDataset(
+            df,
+            config["wrench_cols"],
+            config["pose_cols"],
+            config["label_cols"],
+            window=config["window"],
+            wrench_norm_mu=mu,
+            wrench_norm_sd=sd,
+            start=0,
+            end=N,
+            trial_col=trial_col,
+            samples_per_epoch=int(samples_per_epoch),
+            rng=np.random.default_rng(config["seed"] + epoch_seed_offset),
+            allowed_trials=train_trial_ids,
+        )
+
+    train_ds = build_random_train_ds(epoch_seed_offset=0)
     val_ds = WrenchPoseChunkDataset(
         df,
         config["wrench_cols"],
@@ -752,6 +827,10 @@ def main():
     print(f"Input features: 12 (6 wrench + 6 relative pose) | window={config['window']} (fixed), random-chunk training enabled")
 
     for epoch in range(start_epoch, config["epochs"] + 1):
+        # Optionally rebuild (resample) random training dataset each epoch with fresh RNG seed.
+        if config.get("resample_train_each_epoch", False) and epoch > start_epoch:
+            train_ds = build_random_train_ds(epoch_seed_offset=epoch)
+            train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
         tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)
         vl_loss, mae_per_dim, rmse_per_dim, mae_mean, rmse_mean = evaluate(model, val_loader, device, loss_fn)
 
@@ -766,16 +845,29 @@ def main():
         })
 
         if (epoch % int(config.get("classify_every", 5))) == 0:
-            mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths = evaluate_classification(
+            mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification(
                 model, val_loader, device, config["out_dir"], tuple(config.get("class_boundaries", [0.5, 0.75]))
             )
             print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]} | 3-class_mean_acc={mean_acc3:.4f}")
+            print(f"Overall limit detection: TP={overall_metrics['TP']} FP={overall_metrics['FP']} TN={overall_metrics['TN']} FN={overall_metrics['FN']} | "
+                  f"Sens={overall_metrics['sensitivity']:.3f} Spec={overall_metrics['specificity']:.3f} Prec={overall_metrics['precision']:.3f} NPV={overall_metrics['npv']:.3f} Acc={overall_metrics['accuracy']:.3f}")
             log_payload = {
                 "val_class_mean_acc": mean_acc,
                 **{f"val_class_acc_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc_per_dim)},
                 "confusion_matrix_img": wandb.Image(fig_path),
                 "classification_accuracy_3class": mean_acc3,
                 **{f"val_class_acc_3class_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
+                # Overall limit detection metrics
+                "overall_limit_confusion_matrix": wandb.Image(overall_metrics["fig_path"]),
+                "overall_limit_TP": overall_metrics["TP"],
+                "overall_limit_FP": overall_metrics["FP"],
+                "overall_limit_TN": overall_metrics["TN"],
+                "overall_limit_FN": overall_metrics["FN"],
+                "overall_limit_sensitivity": overall_metrics["sensitivity"],
+                "overall_limit_specificity": overall_metrics["specificity"],
+                "overall_limit_precision": overall_metrics["precision"],
+                "overall_limit_NPV": overall_metrics["npv"],
+                "overall_limit_accuracy": overall_metrics["accuracy"],
             }
             for lbl, paths in per_dim_plot_paths.items():
                 if "cm3" in paths:

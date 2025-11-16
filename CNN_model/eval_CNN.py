@@ -53,7 +53,8 @@ def make_jsonable(obj):
 # Evaluation configuration (edit as needed)
 EVAL_CONFIG = {
     # Path to checkpoint (.pt). If None, defaults to BASE_CONFIG['out_dir']/best_model_regression.pt
-    "checkpoint": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v5/best_model_regression.pt",
+    # "checkpoint": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v5/best_model_regression.pt", # use these for paper results 
+    "checkpoint": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v6/best_model_regression.pt",
     # Optional CSV override. If None, uses the CSV path from the checkpoint's config
     "csv": None,
     # Optional path to save per-timestep prediction CSV. If None, skip saving predictions
@@ -211,7 +212,7 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
     if not preds_list:
         # Return empty defaults
         empty_cm5_path = os.path.join(out_dir, "confusion_matrix_filtered.png")
-        return 0.0, [0.0]*6, np.zeros((5,5), dtype=np.int64), empty_cm5_path, 0.0, [0.0]*6, {lbl: {} for lbl in ["X","Y","Z","A","B","C"]}, {
+        return 0.0, [0.0]*6, np.zeros((5,5), dtype=np.int64), empty_cm5_path, 0.0, [0.0]*6, {lbl: {} for lbl in ["X","Y","Z","Roll","Pitch","Yaw"]}, {
             "TP": 0, "FP": 0, "TN": 0, "FN": 0,
             "sensitivity": 0.0, "specificity": 0.0, "precision": 0.0, "npv": 0.0, "accuracy": 0.0,
             "fig_path": os.path.join(out_dir, "overall_limit_confusion_matrix_filtered.png"),
@@ -238,8 +239,11 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
     import matplotlib.pyplot as plt
     import seaborn as sns
     sns.set(style="whitegrid")
-    dim_labels_local = ["X","Y","Z","A","B","C"]
+    dim_labels_local = ["X","Y","Z","Roll","Pitch","Yaw"]
     class_names_3 = ["Neg","Neu","Pos"]
+    # Create dynamic labels with boundaries for 3-class confusion plots
+    b0_vis, b1_vis = float(boundaries[0]), float(boundaries[1])
+    three_class_labels = [f"< -{b0_vis:.2f}", f"|x| < {b0_vis:.2f}", f"> {b0_vis:.2f}"]
 
     acc5_per_dim, acc3_per_dim = [], []
     per_dim_plot_paths = {lbl: {} for lbl in dim_labels_local}
@@ -286,8 +290,8 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
         ax_cm.set_title(f"3-Class Confusion ({lbl}, filtered)")
         ax_cm.set_xlabel("Predicted")
         ax_cm.set_ylabel("True")
-        ax_cm.set_xticklabels(class_names_3)
-        ax_cm.set_yticklabels(class_names_3, rotation=0)
+        ax_cm.set_xticklabels(three_class_labels)
+        ax_cm.set_yticklabels(three_class_labels, rotation=0)
         fig_cm.tight_layout()
         cm3_path = os.path.join(out_dir, f"confusion_matrix_3class_dim_{lbl}_filtered.png")
         fig_cm.savefig(cm3_path, dpi=150)
@@ -306,7 +310,7 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
         ax_b.bar(x - width/2, fp, width, label="FP", color="#e57373")
         ax_b.bar(x + width/2, fn, width, label="FN", color="#64b5f6")
         ax_b.set_title(f"3-Class FP/FN ({lbl}, filtered)")
-        ax_b.set_xticks(x, class_names_3)
+        ax_b.set_xticks(x, three_class_labels)
         ax_b.set_ylabel("Count")
         ax_b.legend()
         fig_b.tight_layout()
@@ -320,7 +324,7 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
         with np.errstate(divide='ignore', invalid='ignore'):
             per_class_acc = np.where(per_class_den>0, np.diag(cm3)/per_class_den, 0.0)
         fig_a, ax_a = plt.subplots(figsize=(5, 4))
-        ax_a.bar(class_names_3, per_class_acc, color="#81c784")
+        ax_a.bar(three_class_labels, per_class_acc, color="#81c784")
         ax_a.set_ylim(0, 1)
         ax_a.set_title(f"3-Class Per-Class Acc ({lbl}, filtered)")
         ax_a.set_ylabel("Accuracy")
@@ -349,6 +353,7 @@ def evaluate_classification_filtered(model, loader, device, out_dir: str, bounda
     ax.set_title("Validation Confusion Matrix (Aggregated, filtered)")
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
+    num_classes = 5
     ax.set_xticks(range(num_classes))
     ax.set_yticks(range(num_classes))
     for i in range(num_classes):
@@ -470,7 +475,8 @@ def main():
 
     # 6. Classification evaluation (5-class & 3-class + overall limit detection)
     # boundaries = tuple(ckpt_config.get("class_boundaries", [0.5, 0.75]))
-    boundaries = [0.80,0.90]
+    # boundaries = [0.80,0.90] # use this for original paper results
+    boundaries = [0.75,0.9] # use this for original paper results
     b0 = float(boundaries[0])  # inner boundary controls neutral region size
     b1 = float(boundaries[1])  # outer boundary for far class thresholds
     out_dir = ckpt_config["out_dir"]
@@ -574,6 +580,20 @@ def main():
     pr_margins = pr_margins[pr_margins < b0]
     pr_points = build_pr_curve(P_eval, G_eval, pr_margins, b0)
 
+    # ---- PR margin grid (define & normalize once) ----
+    pr_margins_cfg = EVAL_CONFIG.get("pr_margin_values")
+    if pr_margins_cfg is None:
+        pr_margins = np.linspace(0.0, b0 - 1e-3, 31, dtype=float)
+    else:
+        pr_margins = np.asarray(pr_margins_cfg, dtype=float)
+
+    # Robust normalization to 1-D float array
+    pr_margins = np.asarray(pr_margins, dtype=float)
+    pr_margins = np.ravel(pr_margins)                 # flatten (handles [[...]] or (N,1))
+    pr_margins = pr_margins[np.isfinite(pr_margins)]  # keep finite values only
+    pr_margins = pr_margins[(pr_margins >= 0) & (pr_margins < b0)]  # valid range
+
+
     # Confusion matrix for each margin (overall any-dim detection)
     import matplotlib
     matplotlib.use("Agg")
@@ -590,7 +610,7 @@ def main():
     # NEW: per-margin 5-class combined per-dimension and aggregated paths
     combined_dim_5class_cm_paths_by_margin = {}
     aggregated_5class_cm_paths_by_margin = {}
-    dim_labels_margin = ["X","Y","Z","A","B","C"]
+    dim_labels_margin = ["X","Y","Z","Roll","Pitch","Yaw"]
     for m in pr_margins:
         nl, nh = -b0 + float(m), b0 - float(m)
         pred_outside_any = ((P_eval <= nl) | (P_eval >= nh)).any(axis=1)
@@ -639,8 +659,8 @@ def main():
             axd.set_title(f"{lbl}")
             axd.set_xlabel("Predicted nominal-range exceedance")
             axd.set_ylabel("True nominal-range exceedance")
-            axd.set_xticklabels(["Neg","Pos"]) 
-            axd.set_yticklabels(["Neg","Pos"], rotation=0)
+            axd.set_xticklabels([f"<= -{b0:.2f}", f">= {b0:.2f}"]) 
+            axd.set_yticklabels([f"<= -{b0:.2f}", f">= {b0:.2f}"], rotation=0)
         fig_b.suptitle(f"Chunk Per-Dim Confusions (m={float(m):.3f})" + title_suffix, fontsize=14)
         fig_b.tight_layout(rect=[0,0,1,0.95])
         out_b = os.path.join(margin_cm_dir, f"combined_dim_confusions_margin_{float(m):.3f}.png")
@@ -735,16 +755,20 @@ def main():
         cm5_agg = np.zeros((5,5), dtype=np.int64)
         for t, p in zip(G5, P5):
             cm5_agg[t, p] += 1
-        rs5a = cm5_agg.sum(axis=1, keepdims=True)
-        cm5a_norm = np.where(rs5a>0, cm5_agg/rs5a, 0.0)
-        annot5a = np.array([[f"{cm5_agg[i,j]}\n{cm5a_norm[i,j]:.2f}" for j in range(5)] for i in range(5)])
-        fig5a, ax5a = plt.subplots(figsize=(6,5))
-        sns.heatmap(cm5a_norm, ax=ax5a, annot=annot5a, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar_kws={"label":"Row-Normalized"})
-        ax5a.set_title(f"Aggregated 5-Class Confusion (margin={float(m):.3f})")
+
+        # Save 5-class confusion image
+        fig5a, ax5a = plt.subplots(figsize=(6, 5))
+        im5a = ax5a.imshow(cm5_agg, cmap="Blues")
+        ax5a.set_title("Validation Confusion Matrix (Aggregated, filtered)")
         ax5a.set_xlabel("Predicted")
         ax5a.set_ylabel("True")
-        ax5a.set_xticklabels(class_names_5)
-        ax5a.set_yticklabels(class_names_5, rotation=0)
+        num_classes = 5
+        ax5a.set_xticks(range(num_classes))
+        ax5a.set_yticks(range(num_classes))
+        for i in range(num_classes):
+            for j in range(num_classes):
+                ax5a.text(j, i, str(cm5_agg[i, j]), ha="center", va="center", fontsize=8, color="#222222")
+        fig5a.colorbar(im5a, ax=ax5a, fraction=0.046, pad=0.04)
         fig5a.tight_layout()
         agg5_path = os.path.join(margin_cm_dir, f"aggregated_5class_confusion_margin_{float(m):.3f}.png")
         fig5a.savefig(agg5_path, dpi=150)
@@ -782,7 +806,7 @@ def main():
         combined_dim_accbar_paths_by_margin[float(m)] = combined_acc_m_path
         
     # Labels for 6 dimensions
-    dim_labels = ["X","Y","Z","A","B","C"]
+    dim_labels = ["X","Y","Z","Roll","Pitch","Yaw"]
 
     # Build per-dimension PR points for summary JSON
     pr_points_per_dim = {}
@@ -866,6 +890,16 @@ def main():
     pr_curve_overall_path = os.path.join(eval_dir, "pr_curve_overall_dims_appended.png")
     fig.savefig(pr_curve_overall_path, dpi=160)
     plt.close(fig)
+
+    # ---- PR margin grid (define ONCE, before any usage) ----
+    pr_margins_cfg = EVAL_CONFIG.get("pr_margin_values")
+    if pr_margins_cfg is None:
+        pr_margins = np.linspace(0.0, b0 - 1e-3, 31, dtype=float)
+    else:
+        pr_margins = np.asarray(pr_margins_cfg, dtype=float)
+    # keep only valid margins (< b0)
+    pr_margins = pr_margins[pr_margins < b0]
+
 
     # Save PR points CSV (overall appended)
     pr_points_csv = EVAL_CONFIG.get("pr_points_csv") or os.path.join(eval_dir, "limit_detection_pr_points_overall.csv")
@@ -1083,6 +1117,9 @@ def main():
 
 
 
+
+
+
             # 5-class confusion matrix image (per dim)
             cm5_d = np.zeros((5,5), dtype=np.int64)
             for t, p in zip(gt_labels5, pred_labels5):
@@ -1194,8 +1231,8 @@ def main():
                         cbar_kws={"label": "Row-Normalized"})
             title_suffix_chunk = f" (chunk-filter kept {chunk_filter_info['kept']}/{n_chunks})" if chunk_filter_info["applied"] else ""
             ax_o.set_title(f"Chunk Overall Limit Confusion (m={float(m):.3f})" + title_suffix_chunk)
-            ax_o.set_xlabel("Pred exceedance")
-            ax_o.set_ylabel("True exceedance")
+            ax_o.set_xlabel("Predicted nominal-range exceedance")
+            ax_o.set_ylabel("True nominal-range exceedance")
             ax_o.set_xticklabels(["Neg","Pos"])
             ax_o.set_yticklabels(["Neg","Pos"], rotation=0)
             fig_o.tight_layout()
@@ -1222,10 +1259,10 @@ def main():
                 axd = axes_bf[d]
                 sns.heatmap(cm_d_norm, ax=axd, annot=annot_d, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
                 axd.set_title(f"{lbl}")
-                axd.set_xlabel("Pred exceedance")
-                axd.set_ylabel("True exceedance")
-                axd.set_xticklabels(["Neg","Pos"]) 
-                axd.set_yticklabels(["Neg","Pos"], rotation=0)
+                axd.set_xlabel("Predicted nominal-range exceedance")
+                axd.set_ylabel("True nominal-range exceedance")
+                axd.set_xticklabels([f"<= -{b0:.2f}", f">= {b0:.2f}"]) 
+                axd.set_yticklabels([f"<= -{b0:.2f}", f">= {b0:.2f}"], rotation=0)
             fig_b.suptitle(f"Chunk Per-Dim Confusions (m={float(m):.3f})" + title_suffix_chunk, fontsize=14)
             fig_b.tight_layout(rect=[0,0,1,0.95])
             out_b = os.path.join(chunk_margin_dir, f"combined_dim_confusions_margin_{float(m):.3f}.png")
@@ -1233,7 +1270,7 @@ def main():
             plt.close(fig_b)
             chunk_combined_dim_confusion_paths_by_margin[float(m)] = out_b
 
-            # Per-dimension 3-class confusion combined figure with margin band
+            # Per-dimension 3-class confusion for combined figure with margin band
             fig_c3, axes_c3 = plt.subplots(2, 3, figsize=(12, 7))
             axes_c3f = axes_c3.flatten()
             for d, lbl in enumerate(dim_labels_margin):
@@ -1252,14 +1289,17 @@ def main():
                 axc = axes_c3f[d]
                 sns.heatmap(cm3_norm, ax=axc, annot=annot, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
                 axc.set_title(f"{lbl}")
-                axc.set_xlabel("Pred 3-class")
-                axc.set_ylabel("True 3-class")
+                # axc.set_xlabel("Pred 3-class")
+                # axc.set_ylabel("True 3-class")
+                axc.set_xlabel("Inferred Class")
+                axc.set_ylabel("True Class")
                 axc.set_xticklabels(class_names_3)
                 axc.set_yticklabels(class_names_3, rotation=0)
-            fig_c3.suptitle(f"Chunk Per-Dim 3-Class Confusions (m={float(m):.3f})" + title_suffix_chunk, fontsize=14)
+            # fig_c3.suptitle(f"Chunk Per-Dim 3-Class Confusions (m={float(m):.3f})" + title_suffix_chunk, fontsize=14)
+            fig_c3.suptitle(f"Classification Confusion Matrices Per Dimension", fontsize=14)
             fig_c3.tight_layout(rect=[0,0,1,0.95])
             out_c3 = os.path.join(chunk_margin_dir, f"combined_dim_3class_confusions_margin_{float(m):.3f}.png")
-            fig_c3.savefig(out_c3, dpi=160)
+            fig_c3.savefig(out_c3, dpi=300)
             plt.close(fig_c3)
             chunk_combined_dim_3class_cm_paths_by_margin[float(m)] = out_c3
 
@@ -1305,9 +1345,9 @@ def main():
                             np.where(pr_peak_vals <  nh, 2,
                             np.where(pr_peak_vals <  b1, 3, 4))))
             gt_c5_all = np.where(gt_peak_vals <= -b1, 0,
-                          np.where(gt_peak_vals <= nl, 1,
-                          np.where(gt_peak_vals <  nh, 2,
-                          np.where(gt_peak_vals <  b1, 3, 4))))
+                      np.where(gt_peak_vals <= nl, 1,
+                      np.where(gt_peak_vals <  nh, 2,
+                      np.where(gt_peak_vals <  b1, 3, 4))))
             P5c = pred_c5_all.reshape(-1)
             G5c = gt_c5_all.reshape(-1)
             cm5c = np.zeros((5,5), dtype=np.int64)
@@ -1344,7 +1384,7 @@ def main():
             nl_main, nh_main = -b0 + float(margin_main), b0 - float(margin_main)
             # 3-class mapping using margin_main neutral band
             gt_c_margin = np.where(gt_peak_vals <= nl_main, 0, np.where(gt_peak_vals >= nh_main, 2, 1))  # shape [kept_chunks,6]
-            pr_c_margin = np.where(pr_peak_vals <= nl_main, 0, np.where(pr_peak_vals >= nh_main, 2, 1))
+            pr_margins = np.where(pr_peak_vals <= nl_main, 0, np.where(pr_peak_vals >= nh_main, 2, 1))
             # Save CSV: chunk_index plus GT_/Pred_ per dim (indices refer to filtered ordering)
             chunk_margin_predictions_csv = os.path.join(chunk_eval_dir, f"chunk_margin_{margin_main:.3f}_predictions.csv")
             import csv as _csv
@@ -1353,7 +1393,7 @@ def main():
                 header = ["chunk_filtered_idx"] + [f"gt_{d}" for d in dim_labels] + [f"pred_{d}" for d in dim_labels]
                 writer.writerow(header)
                 for ci in range(gt_peak_vals.shape[0]):
-                    writer.writerow([ci] + gt_c_margin[ci].tolist() + pr_c_margin[ci].tolist())
+                    writer.writerow([ci] + gt_c_margin[ci].tolist() + pr_margins[ci].tolist())
         # Save chunk metrics JSON (including margin sweep)
         chunk_metrics.update({
             "mean_acc_5class": chunk_mean_acc5,
@@ -1366,7 +1406,8 @@ def main():
             # margin sweep summary (paths only)
             "by_margin": {
                 "dir": chunk_margin_dir,
-                "margins": [float(m) for m in pr_margins],
+                # "margins": [float(m) for m in pr_margins],
+                "margins": pr_margins.astype(float).ravel().tolist(), 
                 "overall_confusion_paths_by_margin": chunk_cm_paths_by_margin,
                 "combined_dim_confusions_by_margin": chunk_combined_dim_confusion_paths_by_margin,
                 "combined_dim_3class_confusions_by_margin": chunk_combined_dim_3class_cm_paths_by_margin,
@@ -1399,16 +1440,16 @@ def main():
             "val_loss": val_loss,
             "mae_mean": mae_mean,
             "rmse_mean": rmse_mean,
-            "mae_per_dim": {d: v for d, v in zip(["X","Y","Z","A","B","C"], mae_per_dim)},
-            "rmse_per_dim": {d: v for d, v in zip(["X","Y","Z","A","B","C"], rmse_per_dim)},
+            "mae_per_dim": {d: v for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], mae_per_dim)},
+            "rmse_per_dim": {d: v for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], rmse_per_dim)},
         },
         "classification": {
             "boundaries": boundaries,
             "inner_boundary_b0": b0,
             "mean_acc_5class": mean_acc5,
-            "acc_5class_per_dim": {d: v for d, v in zip(["X","Y","Z","A","B","C"], acc5_per_dim)},
+            "acc_5class_per_dim": {d: v for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], acc5_per_dim)},
             "mean_acc_3class": mean_acc3,
-            "acc_3class_per_dim": {d: v for d, v in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
+            "acc_3class_per_dim": {d: v for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], acc3_per_dim)},
             "overall_limit_detection": overall_metrics,
             "confusion_matrix_5class_path": cm5_path,
             "per_dim_plots": per_dim_plot_paths,
@@ -1444,12 +1485,32 @@ def main():
     # 9. Print concise summary
     print("--- Regression Metrics ---")
     print(f"val_loss={val_loss:.6f} mae_mean={mae_mean:.6f} rmse_mean={rmse_mean:.6f}")
-    print("MAE per dim: " + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","A","B","C"], mae_per_dim)))
-    print("RMSE per dim: " + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","A","B","C"], rmse_per_dim)))
+    print("MAE per dim: " + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], mae_per_dim)))
+    print("RMSE per dim: " + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], rmse_per_dim)))
+
+    # NEW: Output and print a table of normalized MAE and RMSE per dimension (plus mean)
+    dims_table = ["X","Y","Z","Roll","Pitch","Yaw"]
+    df_err = pd.DataFrame({
+        "Dim": dims_table,
+        "MAE_norm": [float(x) for x in mae_per_dim],
+        "RMSE_norm": [float(x) for x in rmse_per_dim],
+    })
+    df_err.loc[len(df_err)] = ["MEAN", float(mae_mean), float(rmse_mean)]
+    # Save as CSV in eval directory
+    err_table_csv = os.path.join(eval_dir, "regression_errors_normalized.csv")
+    try:
+        df_err.to_csv(err_table_csv, index=False)
+    except Exception:
+        pass
+    print("--- Regression Errors (normalized) ---")
+    print(df_err.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+    if os.path.isfile(err_table_csv):
+        print(f"Saved normalized regression error table CSV: {err_table_csv}")
+
     print("--- Classification (5-class) ---")
-    print(f"mean_acc_5class={mean_acc5:.4f} per_dim=" + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","A","B","C"], acc5_per_dim)))
+    print(f"mean_acc_5class={mean_acc5:.4f} per_dim=" + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], acc5_per_dim)))
     print("--- Classification (3-class) ---")
-    print(f"mean_acc_3class={mean_acc3:.4f} per_dim=" + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","A","B","C"], acc3_per_dim)))
+    print(f"mean_acc_3class={mean_acc3:.4f} per_dim=" + ", ".join(f"{d}:{v:.4f}" for d, v in zip(["X","Y","Z","Roll","Pitch","Yaw"], acc3_per_dim)))
     if filter_info["applied"]:
         print(f"Applied GT-boundary buffer filter: buffer={filter_info['buffer']} mode={filter_info['mode']} kept={filter_info['kept']} excluded={filter_info['excluded']}")
     print("--- Overall Limit Detection ---")

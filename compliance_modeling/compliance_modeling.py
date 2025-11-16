@@ -63,7 +63,7 @@ CONFIG = {
     # Keep samples whose selected pose dims lie within the inner band:
     #   frac*min_neg <= value <= frac*max_pos
     # Works best after demeaning (so mean≈0). Fraction in [0,1].
-    "filter_enable": True,
+    "filter_enable": False,
     "filter_pose_dims": ["X", "Y", "Z", "A", "B", "C"],
     "filter_logic": "all",       # Combine per-dim masks: "any" (OR) or "all" (AND)
     "filter_fraction": 0.8,

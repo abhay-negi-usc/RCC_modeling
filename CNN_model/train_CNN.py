@@ -41,7 +41,7 @@ CONFIG = {
     "trial_col": "trial",  # must exist in CSV; used to prevent cross-trial chunks
     "window": 16384,
     "stride": 16384,
-    "batch_size": 16,
+    "batch_size": 64,
     "epochs": 1_000_000,
     "lr": 1e-3,
     "val_split": 0.2,
@@ -51,10 +51,10 @@ CONFIG = {
 
     # CNN architecture (replaces Transformer params)
     "cnn_hidden": 36,            # base channels per residual block
-    "cnn_layers": 24,              # number of residual blocks (controls depth and receptive field)
+    "cnn_layers": 8,              # number of residual blocks (controls depth and receptive field)
     "cnn_kernel": 11,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
-    "cnn_dilation_base": 2,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
+    "cnn_dilation_base": 16,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
     "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
 
     # Random-chunk training
@@ -63,7 +63,7 @@ CONFIG = {
     "train_samples_per_epoch": 1_000,
 
     # "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
-    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v5",
+    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v7",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,

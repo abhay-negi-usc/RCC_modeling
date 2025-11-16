@@ -232,8 +232,15 @@ for label in ['X', 'Y', 'Z', 'A', 'B', 'C']:
         print(f"    ({percentage:.2f}%)")
         
 
-# save processed data to csv
-output_path = os.path.splitext(data_path)[0] + "_processed.csv"
-df_processed.to_csv(output_path, index=False)   
+# print out the displacement values for +/- 1 
+for i, label in enumerate(['X', 'Y', 'Z', 'A', 'B', 'C']):
+    mean_val = df_processed[label].mean()
+    std_val = df_processed[label].std()
+    half_range = 2 * std_val
+    print(f"For {label}, ±1 normalized corresponds to ±{half_range:.2f} units from the mean ({mean_val:.2f}).")
+
+# # save processed data to csv
+# output_path = os.path.splitext(data_path)[0] + "_processed.csv"
+# df_processed.to_csv(output_path, index=False)   
 
 # import pdb; pdb.set_trace()

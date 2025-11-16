@@ -77,6 +77,11 @@ EVAL_CONFIG = {
     "exclude_boundary_buffer": None,
     # Mode for exclusion when using the buffer: 'any' => drop a timestep if ANY dim is near a boundary; 'all' => drop only if ALL dims are near.
     "exclude_boundary_mode": "any",
+
+    # NEW — persistence (consecutive) exceedance inside a chunk
+    "persistence_min": 10,          # timesteps; set 0/None to disable
+    "persistence_margin": 0.1,     # like your margin: shrinks neutral band (0 ⇒ use ±b0)
+    "persistence_anydim": False,    # overall label positive if any dimension persists
 }
 
 # Reuse utilities / classes / functions from training script without triggering training.
@@ -148,9 +153,11 @@ def compute_limit_detection_metrics(pred_norm: np.ndarray, gt_norm: np.ndarray, 
     # Negative margins are allowed (they expand the neutral region). Only invalid if margin >= b0.
     if margin >= b0:
         raise ValueError(f"margin {margin} >= inner boundary {b0}; neutral region would vanish or invert.")
-    neutral_low = -b0 + margin
-    neutral_high = b0 - margin
-    pred_outside = ((pred_norm <= neutral_low) | (pred_norm >= neutral_high)).any(axis=1)
+    neutral_low = -b0 
+    neutral_high = b0 
+    neutral_low_with_margin = -b0 + margin
+    neutral_high_with_margin = b0 - margin
+    pred_outside = ((pred_norm <= neutral_low_with_margin) | (pred_norm >= neutral_high_with_margin)).any(axis=1)
     gt_outside = ((gt_norm <= neutral_low) | (gt_norm >= neutral_high)).any(axis=1)
     TP = int(np.sum(pred_outside & gt_outside))
     TN = int(np.sum(~pred_outside & ~gt_outside))
@@ -196,6 +203,24 @@ except Exception:  # NameError or others
         else:
             keep = ~near.any(axis=1)
         return keep
+
+def _has_run_of_true(bool_arr: np.ndarray, min_len: int) -> bool:
+    """
+    Return True if there exists a run of >= min_len consecutive True
+    in a 1D boolean array.
+    """
+    if min_len is None or min_len <= 1:
+        return bool(np.any(bool_arr))
+    # run-length of True via diff trick
+    x = np.concatenate(([False], bool_arr, [False])).astype(np.int8)
+    diff = np.diff(x)
+    run_starts = np.where(diff == 1)[0]
+    run_ends   = np.where(diff == -1)[0]
+    if run_starts.size == 0:
+        return False
+    max_run = int(np.max(run_ends - run_starts))
+    return max_run >= int(min_len)
+
 
 # NEW: A local copy of evaluate_classification logic that supports optional GT-boundary filtering
 @torch.no_grad()
@@ -538,8 +563,10 @@ def main():
         import matplotlib.pyplot as plt
         import seaborn as sns
         sns.set(style="whitegrid")
-        neutral_low = -b0 + margin_main
-        neutral_high = b0 - margin_main
+        neutral_low = -b0 
+        neutral_high = b0 
+        neutral_low_with_margin = -b0 + margin_main
+        neutral_high_with_margin = b0 - margin_main
         pred_outside = ((P_eval <= neutral_low) | (P_eval >= neutral_high)).any(axis=1)
         gt_outside = ((G_eval <= neutral_low) | (G_eval >= neutral_high)).any(axis=1)
         TP = int(np.sum(pred_outside & gt_outside))
@@ -1394,6 +1421,376 @@ def main():
                 writer.writerow(header)
                 for ci in range(gt_peak_vals.shape[0]):
                     writer.writerow([ci] + gt_c_margin[ci].tolist() + pr_margins[ci].tolist())
+
+        
+        # 6c. Chunk-based PERSISTENCE evaluation (consecutive exceedance inside chunk)
+        K = EVAL_CONFIG.get("persistence_min", None)
+        if K is not None and int(K) >= 1 and n_chunks > 0:
+            K = int(K)
+            p_margin = float(EVAL_CONFIG.get("persistence_margin", 0.0))
+            # neutral band becomes (-b0 + p_margin, b0 - p_margin)
+            nl_p, nh_p = -b0, b0 
+            nl_p_with_margin, nh_p_with_margin = -b0 + p_margin, b0 - p_margin
+            anydim_mode = bool(EVAL_CONFIG.get("persistence_anydim", True))
+
+            chunk_persist_dir = os.path.join(
+                eval_dir,
+                f"chunk_persistence_w{chunk_window}_k{K}_m{p_margin:.3f}{'_anydim' if anydim_mode else '_alldims'}"
+            )
+            os.makedirs(chunk_persist_dir, exist_ok=True)
+
+            # Use the same truncated arrays as the chunk evaluation
+            P_use = P_all[: n_chunks * chunk_window, :]
+            G_use = G_all[: n_chunks * chunk_window, :]
+
+            # Reshape to [n_chunks, chunk_window, 6]
+            P_ch = P_use.reshape(n_chunks, chunk_window, 6)
+            G_ch = G_use.reshape(n_chunks, chunk_window, 6)
+
+            # Per-dimension persistence decisions for each chunk
+            # pred/gt exceedance (per timestep)
+            pred_ex = (P_ch <= nl_p_with_margin) | (P_ch >= nh_p_with_margin)           # [C,W,6]
+            gt_ex   = (G_ch <= nl_p) | (G_ch >= nh_p)           # [C,W,6]
+
+            # Reduce inside chunk using “persistence of length ≥ K”
+            pred_persist = np.zeros((n_chunks, 6), dtype=bool)
+            gt_persist   = np.zeros((n_chunks, 6), dtype=bool)
+            for c in range(n_chunks):
+                for d in range(6):
+                    pred_persist[c, d] = _has_run_of_true(pred_ex[c, :, d], K)
+                    gt_persist[c, d]   = _has_run_of_true(gt_ex[c, :, d],   K)
+
+            # ---------- Per-dimension persistence confusion (binary) ----------
+            import seaborn as sns
+            sns.set(style="whitegrid")
+
+            dim_labels = ["X","Y","Z","Roll","Pitch","Yaw"]
+            fig_pd, axes_pd = plt.subplots(2, 3, figsize=(12, 7))
+            axes_pd_f = axes_pd.flatten()
+            per_dim_cm_paths = {}
+
+            for d, lbl in enumerate(dim_labels):
+                y_true = gt_persist[:, d]
+                y_pred = pred_persist[:, d]
+                # cm rows = true [Neg, Pos], cols = pred [Neg, Pos]
+                TN = int(np.sum(~y_true & ~y_pred))
+                FP = int(np.sum(~y_true &  y_pred))
+                FN = int(np.sum( y_true & ~y_pred))
+                TP = int(np.sum( y_true &  y_pred))
+                cm = np.array([[TN, FP],[FN, TP]], dtype=np.int64)
+                rs = cm.sum(axis=1, keepdims=True)
+                cm_norm = np.where(rs>0, cm/rs, 0.0)
+
+                ax = axes_pd_f[d]
+                annot = np.array([[f"{cm[0,0]}\n{cm_norm[0,0]:.2f}", f"{cm[0,1]}\n{cm_norm[0,1]:.2f}"],
+                                [f"{cm[1,0]}\n{cm_norm[1,0]:.2f}", f"{cm[1,1]}\n{cm_norm[1,1]:.2f}"]])
+                sns.heatmap(cm_norm, ax=ax, annot=annot, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
+                ax.set_title(lbl)
+                ax.set_xlabel("Predicted (persist)")
+                ax.set_ylabel("True (persist)")
+                ax.set_xticklabels(["Neg","Pos"])
+                ax.set_yticklabels(["Neg","Pos"], rotation=0)
+
+                # save individual cm too
+                fig_i, ax_i = plt.subplots(figsize=(5.5,4.5))
+                sns.heatmap(cm_norm, ax=ax_i, annot=annot, fmt="", cmap="Blues", vmin=0.0, vmax=1.0,
+                            cbar_kws={"label":"Row-Normalized"})
+                ax_i.set_title(f"Persistence Confusion ({lbl})  K={K}, m={p_margin:.3f}")
+                ax_i.set_xlabel("Predicted (persist)")
+                ax_i.set_ylabel("True (persist)")
+                ax_i.set_xticklabels(["Neg","Pos"])
+                ax_i.set_yticklabels(["Neg","Pos"], rotation=0)
+                fig_i.tight_layout()
+                path_i = os.path.join(chunk_persist_dir, f"persist_confusion_dim_{lbl}.png")
+                fig_i.savefig(path_i, dpi=160)
+                plt.close(fig_i)
+                per_dim_cm_paths[lbl] = path_i
+
+            fig_pd.suptitle(f"Per-Dimension Persistence Confusions  (W={chunk_window}, K={K}, m={p_margin:.3f})",
+                            fontsize=14)
+            fig_pd.tight_layout(rect=[0,0,1,0.95])
+            combined_pd_path = os.path.join(chunk_persist_dir, "combined_dim_persistence_confusions.png")
+            fig_pd.savefig(combined_pd_path, dpi=160)
+            plt.close(fig_pd)
+
+            # ---------- Overall (any-dimension) persistence confusion ----------
+            if anydim_mode:
+                y_true_all = gt_persist.any(axis=1)   # any dim persists in GT
+                y_pred_all = pred_persist.any(axis=1) # any dim persists in Pred
+            else:
+                # “all dims must persist” option
+                y_true_all = gt_persist.all(axis=1)
+                y_pred_all = pred_persist.all(axis=1)
+
+            TN = int(np.sum(~y_true_all & ~y_pred_all))
+            FP = int(np.sum(~y_true_all &  y_pred_all))
+            FN = int(np.sum( y_true_all & ~y_pred_all))
+            TP = int(np.sum( y_true_all &  y_pred_all))
+
+            def _sdiv(a,b): return float(a/b) if b>0 else 0.0
+            sensitivity = _sdiv(TP, TP+FN)
+            specificity = _sdiv(TN, TN+FP)
+            precision  = _sdiv(TP, TP+FP)
+            npv        = _sdiv(TN, TN+FN)
+            accuracy   = _sdiv(TP+TN, TP+TN+FP+FN)
+
+            cm_overall = np.array([[TN, FP],[FN, TP]], dtype=np.int64)
+            rs = cm_overall.sum(axis=1, keepdims=True)
+            cm_overall_norm = np.where(rs>0, cm_overall/rs, 0.0)
+
+            fig_o, ax_o = plt.subplots(figsize=(5.5,4.5))
+            annot_o = np.array([[f"{cm_overall[0,0]}\n{cm_overall_norm[0,0]:.2f}", f"{cm_overall[0,1]}\n{cm_overall_norm[0,1]:.2f}"],
+                                [f"{cm_overall[1,0]}\n{cm_overall_norm[1,0]:.2f}", f"{cm_overall[1,1]}\n{cm_overall_norm[1,1]:.2f}"]])
+            sns.heatmap(cm_overall_norm, ax=ax_o, annot=annot_o, fmt="", cmap="Purples", vmin=0.0, vmax=1.0,
+                        cbar_kws={"label":"Row-Normalized"})
+            ax_o.set_title(f"Overall Persistence (W={chunk_window}, K={K}, m={p_margin:.3f}, "
+                        f"{'ANY' if anydim_mode else 'ALL'}-dim)")
+            ax_o.set_xlabel("Predicted (persist)")
+            ax_o.set_ylabel("True (persist)")
+            ax_o.set_xticklabels(["Neg","Pos"])
+            ax_o.set_yticklabels(["Neg","Pos"], rotation=0)
+            fig_o.tight_layout()
+            overall_persist_fig = os.path.join(chunk_persist_dir, "overall_persistence_confusion.png")
+            fig_o.savefig(overall_persist_fig, dpi=160)
+            plt.close(fig_o)
+
+            # Dump a small JSON alongside other eval outputs
+            persist_summary = {
+                "window": int(chunk_window),
+                "K_min_consecutive": int(K),
+                "margin": float(p_margin),
+                "anydim_mode": bool(anydim_mode),
+                "overall": {
+                    "TP": TP, "FP": FP, "TN": TN, "FN": FN,
+                    "sensitivity": sensitivity, "specificity": specificity,
+                    "precision": precision, "npv": npv, "accuracy": accuracy,
+                    "fig_path": overall_persist_fig,
+                },
+                "per_dim_cm_paths": per_dim_cm_paths,
+                "combined_dim_fig": combined_pd_path,
+                "note": "A chunk is labeled positive iff the threshold is exceeded for >= K consecutive timesteps inside the chunk.",
+            }
+            with open(os.path.join(chunk_persist_dir, "persistence_metrics.json"), "w") as fjson:
+                json.dump(make_jsonable(persist_summary), fjson, indent=2)
+
+            # ====== Persistence-based 5-class & 3-class labels + confusion matrices ======
+            # We use inner boundary b0 (with persistence_margin) for "near" and outer boundary b1 (no margin) for "far".
+            # Labeling rule per chunk/dim:
+            #   0 far-  : run(K) over x <= -b1
+            #   1 near- : run(K) over x <  -b0 + m   (and NOT far-)
+            #   4 far+  : run(K) over x >= +b1
+            #   3 near+ : run(K) over x >  +b0 - m   (and NOT far+)
+            #   2 neutral: none of the above persist
+            b0 = float(boundaries[0])
+            b1 = float(boundaries[1])
+            m  = float(p_margin)
+
+            # Masks per sign and band for the whole chunk tensor [C,W,6]
+            # Near (inner, sign-aware, margin applied)
+            gt_near_neg = (G_ch <  (-b0 + m))
+            gt_near_pos = (G_ch >  ( b0 - m))
+            pr_near_neg = (P_ch <  (-b0 + m))
+            pr_near_pos = (P_ch >  ( b0 - m))
+
+            # Far (outer, sign-aware, no margin)
+            gt_far_neg  = (G_ch <= (-b1))
+            gt_far_pos  = (G_ch >= ( b1))
+            pr_far_neg  = (P_ch <= (-b1))
+            pr_far_pos  = (P_ch >= ( b1))
+
+            # Build per-chunk, per-dim 5-class labels with persistence (K-run)
+            def _label_5class_from_masks(near_neg_row, far_neg_row, near_pos_row, far_pos_row, K):
+                # Priority: far- | near- | far+ | near+ | neutral
+                if _has_run_of_true(far_neg_row, K):  # 0
+                    return 0
+                if _has_run_of_true(near_neg_row, K): # 1
+                    return 1
+                if _has_run_of_true(far_pos_row, K):  # 4
+                    return 4
+                if _has_run_of_true(near_pos_row, K): # 3
+                    return 3
+                return 2
+
+            # Compute labels arrays [n_chunks, 6] for GT and Pred
+            gt_labels5_persist = np.zeros((n_chunks, 6), dtype=np.int64)
+            pr_labels5_persist = np.zeros((n_chunks, 6), dtype=np.int64)
+            for c in range(n_chunks):
+                for d in range(6):
+                    gt_labels5_persist[c, d] = _label_5class_from_masks(
+                        gt_near_neg[c, :, d], gt_far_neg[c, :, d],
+                        gt_near_pos[c, :, d], gt_far_pos[c, :, d], K
+                    )
+                    pr_labels5_persist[c, d] = _label_5class_from_masks(
+                        pr_near_neg[c, :, d], pr_far_neg[c, :, d],
+                        pr_near_pos[c, :, d], pr_far_pos[c, :, d], K
+                    )
+
+            # ---- Per-dimension 5-class confusion matrices (persistence) ----
+            class_names_5p = ["-2","-1","0","+1","+2"]
+            fig_cm5p, axes_cm5p = plt.subplots(2, 3, figsize=(12, 7))
+            axes_cm5p_f = axes_cm5p.flatten()
+            cm5p_paths_per_dim = {}
+
+            for d, lbl in enumerate(dim_labels):
+                y_true5 = gt_labels5_persist[:, d]
+                y_pred5 = pr_labels5_persist[:, d]
+                cm5 = np.zeros((5,5), dtype=np.int64)
+                for t, p in zip(y_true5, y_pred5):
+                    cm5[t, p] += 1
+                rs5 = cm5.sum(axis=1, keepdims=True)
+                cm5n = np.where(rs5 > 0, cm5/rs5, 0.0)
+
+                # combined grid cell
+                ax = axes_cm5p_f[d]
+                annot5 = np.array([[f"{cm5[i,j]}\n{cm5n[i,j]:.2f}" for j in range(5)] for i in range(5)])
+                sns.heatmap(cm5n, ax=ax, annot=annot5, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
+                ax.set_title(lbl)
+                ax.set_xlabel("Pred 5-class (persist)")
+                ax.set_ylabel("True 5-class (persist)")
+                ax.set_xticklabels(class_names_5p)
+                ax.set_yticklabels(class_names_5p, rotation=0)
+
+                # save per-dim figure too
+                fig_i, ax_i = plt.subplots(figsize=(5,4))
+                sns.heatmap(cm5n, ax=ax_i, annot=annot5, fmt="", cmap="Blues", vmin=0.0, vmax=1.0,
+                            cbar_kws={"label":"Row-Normalized"})
+                ax_i.set_title(f"{lbl} - Persistence 5-class (K={K}, m={m:.3f})")
+                ax_i.set_xlabel("Pred 5-class (persist)")
+                ax_i.set_ylabel("True 5-class (persist)")
+                ax_i.set_xticklabels(class_names_5p)
+                ax_i.set_yticklabels(class_names_5p, rotation=0)
+                fig_i.tight_layout()
+                path5 = os.path.join(chunk_persist_dir, f"persist_cm5_dim_{lbl}.png")
+                fig_i.savefig(path5, dpi=160)
+                plt.close(fig_i)
+                cm5p_paths_per_dim[lbl] = path5
+
+            fig_cm5p.suptitle(f"Per-Dimension 5-Class (Persistence)  W={chunk_window}, K={K}, m={m:.3f}", fontsize=14)
+            fig_cm5p.tight_layout(rect=[0,0,1,0.95])
+            combined_dim_5class_persist_path = os.path.join(chunk_persist_dir, "combined_dim_5class_persistence_confusions.png")
+            fig_cm5p.savefig(combined_dim_5class_persist_path, dpi=160)
+            plt.close(fig_cm5p)
+
+            # ---- Collapse to 3-class and produce per-dimension 3-class confusions ----
+            # Map: [-2,-1,0,+1,+2] -> [Neg,Neu,Pos] via [-2,-1]->Neg, 0->Neu, [+1,+2]->Pos
+            map3 = np.array([0, 0, 1, 2, 2], dtype=np.int64)
+            class_names_3p = ["Neg","Neu","Pos"]
+
+            fig_cm3p, axes_cm3p = plt.subplots(2, 3, figsize=(12, 7))
+            axes_cm3p_f = axes_cm3p.flatten()
+            cm3p_paths_per_dim = {}
+
+            for d, lbl in enumerate(dim_labels):
+                y_true3 = map3[gt_labels5_persist[:, d]]
+                y_pred3 = map3[pr_labels5_persist[:, d]]
+
+                cm3 = np.zeros((3,3), dtype=np.int64)
+                for t, p in zip(y_true3, y_pred3):
+                    cm3[t, p] += 1
+                rs3 = cm3.sum(axis=1, keepdims=True)
+                cm3n = np.where(rs3 > 0, cm3/rs3, 0.0)
+
+                ax = axes_cm3p_f[d]
+                annot3 = np.array([[f"{cm3[i,j]}\n{cm3n[i,j]:.2f}" for j in range(3)] for i in range(3)])
+                sns.heatmap(cm3n, ax=ax, annot=annot3, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
+                ax.set_title(lbl)
+                ax.set_xlabel("Pred 3-class (persist)")
+                ax.set_ylabel("True 3-class (persist)")
+                ax.set_xticklabels(class_names_3p)
+                ax.set_yticklabels(class_names_3p, rotation=0)
+
+                # save per-dim figure too
+                fig_i, ax_i = plt.subplots(figsize=(5,4))
+                sns.heatmap(cm3n, ax=ax_i, annot=annot3, fmt="", cmap="Blues", vmin=0.0, vmax=1.0,
+                            cbar_kws={"label":"Row-Normalized"})
+                ax_i.set_title(f"{lbl} - Persistence 3-class (K={K}, m={m:.3f})")
+                ax_i.set_xlabel("Pred 3-class (persist)")
+                ax_i.set_ylabel("True 3-class (persist)")
+                ax_i.set_xticklabels(class_names_3p)
+                ax_i.set_yticklabels(class_names_3p, rotation=0)
+                fig_i.tight_layout()
+                path3 = os.path.join(chunk_persist_dir, f"persist_cm3_dim_{lbl}.png")
+                fig_i.savefig(path3, dpi=160)
+                plt.close(fig_i)
+                cm3p_paths_per_dim[lbl] = path3
+
+            fig_cm3p.suptitle(f"Per-Dimension 3-Class (Persistence)  W={chunk_window}, K={K}, m={m:.3f}", fontsize=14)
+            fig_cm3p.tight_layout(rect=[0,0,1,0.95])
+            combined_dim_3class_persist_path = os.path.join(chunk_persist_dir, "combined_dim_3class_persistence_confusions.png")
+            fig_cm3p.savefig(combined_dim_3class_persist_path, dpi=160)
+            plt.close(fig_cm3p)
+
+            # Attach paths to JSON summary (already created later in this block)
+            # If you keep the JSON dump below, just extend 'persist_summary' before writing:
+            # (Place these assignments right before json.dump(...))
+            # persist_summary["per_dim_cm5_paths"] = cm5p_paths_per_dim
+            # persist_summary["combined_dim_5class_fig"] = combined_dim_5class_persist_path
+            # persist_summary["per_dim_cm3_paths"] = cm3p_paths_per_dim
+            # persist_summary["combined_dim_3class_fig"] = combined_dim_3class_persist_path
+
+            # ====== Aggregated (combined) 5-class & 3-class confusions for PERSISTENCE ======
+            # Flatten across all dimensions to mirror the original "aggregated" matrices.
+            # 5-class first
+            G5p = gt_labels5_persist.reshape(-1)
+            P5p = pr_labels5_persist.reshape(-1)
+            cm5p_agg = np.zeros((5, 5), dtype=np.int64)
+            for t, p in zip(G5p, P5p):
+                cm5p_agg[t, p] += 1
+
+            fig5p_agg, ax5p_agg = plt.subplots(figsize=(6, 5))
+            im5p = ax5p_agg.imshow(cm5p_agg, cmap="Blues")
+            ax5p_agg.set_title(f"Persistence Confusion (Aggregated 5-class)  W={chunk_window}, K={K}, m={m:.3f}")
+            ax5p_agg.set_xlabel("Predicted")
+            ax5p_agg.set_ylabel("True")
+            ax5p_agg.set_xticks(range(5)); ax5p_agg.set_yticks(range(5))
+            ax5p_agg.set_xticklabels(["-2","-1","0","+1","+2"])
+            ax5p_agg.set_yticklabels(["-2","-1","0","+1","+2"])
+            for i in range(5):
+                for j in range(5):
+                    ax5p_agg.text(j, i, str(cm5p_agg[i, j]), ha="center", va="center", fontsize=8, color="#222222")
+            fig5p_agg.colorbar(im5p, ax=ax5p_agg, fraction=0.046, pad=0.04)
+            fig5p_agg.tight_layout()
+            aggregated_5class_persist_path = os.path.join(
+                chunk_persist_dir, "aggregated_5class_persistence_confusion.png"
+            )
+            fig5p_agg.savefig(aggregated_5class_persist_path, dpi=150)
+            plt.close(fig5p_agg)
+
+            # 3-class: collapse 5-class via [-2,-1]->Neg(0), 0->Neu(1), [+1,+2]->Pos(2)
+            map3 = np.array([0, 0, 1, 2, 2], dtype=np.int64)
+            G3p = map3[G5p]
+            P3p = map3[P5p]
+            cm3p_agg = np.zeros((3, 3), dtype=np.int64)
+            for t, p in zip(G3p, P3p):
+                cm3p_agg[t, p] += 1
+
+            fig3p_agg, ax3p_agg = plt.subplots(figsize=(6, 5))
+            im3p = ax3p_agg.imshow(cm3p_agg, cmap="Blues")
+            ax3p_agg.set_title(f"Persistence Confusion (Aggregated 3-class)  W={chunk_window}, K={K}, m={m:.3f}")
+            ax3p_agg.set_xlabel("Predicted")
+            ax3p_agg.set_ylabel("True")
+            ax3p_agg.set_xticks(range(3)); ax3p_agg.set_yticks(range(3))
+            class_names_3p = ["Neg","Neu","Pos"]
+            ax3p_agg.set_xticklabels(class_names_3p)
+            ax3p_agg.set_yticklabels(class_names_3p)
+            for i in range(3):
+                for j in range(3):
+                    ax3p_agg.text(j, i, str(cm3p_agg[i, j]), ha="center", va="center", fontsize=8, color="#222222")
+            fig3p_agg.colorbar(im3p, ax=ax3p_agg, fraction=0.046, pad=0.04)
+            fig3p_agg.tight_layout()
+            aggregated_3class_persist_path = os.path.join(
+                chunk_persist_dir, "aggregated_3class_persistence_confusion.png"
+            )
+            fig3p_agg.savefig(aggregated_3class_persist_path, dpi=150)
+            plt.close(fig3p_agg)
+
+            # ---- Add these to the JSON summary before json.dump(...) ----
+            # (Place the assignments below right before you write persist_summary to disk.)
+            # persist_summary["aggregated_5class_fig"] = aggregated_5class_persist_path
+            # persist_summary["aggregated_3class_fig"] = aggregated_3class_persist_path
+
+
+
         # Save chunk metrics JSON (including margin sweep)
         chunk_metrics.update({
             "mean_acc_5class": chunk_mean_acc5,

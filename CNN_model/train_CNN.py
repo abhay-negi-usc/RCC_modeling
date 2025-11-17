@@ -46,6 +46,8 @@ CONFIG = {
     "lr": 1e-3,
     "val_split": 0.2,
     "seed": 42,
+    # NEW: choose how to split train/val. 'trial' (default) or 'window'
+    "split_mode": "window",
     # NEW: enable per-epoch resampling of random training dataset
     "resample_train_each_epoch": True,
 
@@ -54,7 +56,7 @@ CONFIG = {
     "cnn_layers": 8,              # number of residual blocks (controls depth and receptive field)
     "cnn_kernel": 11,              # odd kernel for SAME-length convolution
     "cnn_dropout": 0.1,           # dropout inside blocks for regularization
-    "cnn_dilation_base": 16,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
+    "cnn_dilation_base": 8,       # dilations grow as base^layer: 1,2,4,... to expand receptive field
     "cnn_bidirectional": True,    # SAME padding (non-causal); uses future context in addition to past
 
     # Random-chunk training
@@ -76,7 +78,7 @@ CONFIG = {
 
     # Classification-from-regression evaluation
     "classify_every": 10,
-    "class_boundaries": [0.5, 0.75],
+    "class_boundaries": [0.8, 0.9],
 }
 
 import math
@@ -214,6 +216,39 @@ class WrenchPoseChunkDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
 
 
+# NEW: Dataset that yields chunks from a fixed list of start indices (no crossing trials assumed).
+class FixedStartIndexChunkDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        wrench_cols: List[str],
+        pose_cols: List[str],
+        label_cols: List[str],
+        start_indices: np.ndarray,
+        window: int,
+        wrench_norm_mu: np.ndarray,
+        wrench_norm_sd: np.ndarray,
+    ):
+        assert len(wrench_cols) == 6 and len(pose_cols) == 6 and len(label_cols) == 6
+        self.wrench = zscore_apply(df[wrench_cols].values.astype(np.float32), wrench_norm_mu, wrench_norm_sd).astype(np.float32)
+        self.pose = df[pose_cols].values.astype(np.float32)
+        self.labels = df[label_cols].values.astype(np.float32)
+        self.starts = np.array(start_indices, dtype=np.int64)
+        self.window = int(window)
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, i):
+        s = int(self.starts[i]); e = s + self.window
+        wrench_chunk = self.wrench[s:e, :]
+        pose_chunk = self.pose[s:e, :]
+        rel_pose_chunk = compute_relative_pose(pose_chunk)
+        x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)
+        y = self.labels[s:e, :].astype(np.float32)
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
 class RandomWrenchPoseChunkDataset(Dataset):
     """Randomly sample fixed-length chunks that never cross trial boundaries.
 
@@ -276,6 +311,42 @@ class RandomWrenchPoseChunkDataset(Dataset):
         x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)
         targets_Tx6 = self.labels[start_idx:end_idx, :].astype(np.float32)
         return torch.from_numpy(x), torch.from_numpy(targets_Tx6)
+
+# NEW: Random sampler from a fixed set of valid start indices (train windows) per epoch
+class RandomStartIndexChunkDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        wrench_cols: List[str],
+        pose_cols: List[str],
+        label_cols: List[str],
+        start_indices: np.ndarray,
+        window: int,
+        samples_per_epoch: int,
+        wrench_norm_mu: np.ndarray,
+        wrench_norm_sd: np.ndarray,
+        rng: Optional[np.random.Generator] = None,
+    ):
+        self.wrench = zscore_apply(df[wrench_cols].values.astype(np.float32), wrench_norm_mu, wrench_norm_sd).astype(np.float32)
+        self.pose = df[pose_cols].values.astype(np.float32)
+        self.labels = df[label_cols].values.astype(np.float32)
+        self.starts = np.array(start_indices, dtype=np.int64)
+        self.window = int(window)
+        self.samples_per_epoch = int(samples_per_epoch)
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+    def __len__(self):
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx):
+        s = int(self.rng.choice(self.starts))
+        e = s + self.window
+        wrench_chunk = self.wrench[s:e, :]
+        pose_chunk = self.pose[s:e, :]
+        rel_pose_chunk = compute_relative_pose(pose_chunk)
+        x = np.concatenate([wrench_chunk, rel_pose_chunk], axis=1).astype(np.float32)
+        y = self.labels[s:e, :].astype(np.float32)
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 # ----------------------------
 # Time-Series CNN (TCN)
@@ -737,6 +808,14 @@ def main():
     trials_arr = df[trial_col].values
     unique_trials = pd.unique(trials_arr)  # preserves order of appearance
 
+    # Helper to enumerate valid stride windows within segments
+    def enumerate_stride_indices(segments: List[Tuple[int, int]], window: int, stride: int) -> List[int]:
+        out: List[int] = []
+        for s, e in segments:
+            if (e - s) >= window:
+                out.extend(range(s, e - window + 1, stride))
+        return out
+
     # ------------------------------
     # NEW: Trial subset selection enforcing:
     # 1. Validation consists of whole trials only.
@@ -869,8 +948,23 @@ def main():
     # Persist split metadata for reproducibility (used by eval script)
     split_path = os.path.join(config["out_dir"], "data_split.json")
     try:
+        # Ensure trials are JSON-serializable (convert any numpy types to str)
+        split_meta["val_trials"] = [str(t) for t in split_meta["val_trials"]]
+        split_meta["train_trials"] = [str(t) for t in split_meta["train_trials"]]
+
+        class _NpEncoder(json.JSONEncoder):
+            def default(self, obj):  # type: ignore
+                import numpy as _np
+                if isinstance(obj, (_np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (_np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (_np.ndarray,)):
+                    return obj.tolist()
+                return super().default(obj)
+
         with open(split_path, "w") as f:
-            json.dump(split_meta, f, indent=2)
+            json.dump(split_meta, f, indent=2, cls=_NpEncoder)
         print(f"Saved data split metadata to {split_path}")
         # NEW: write trial-level split labels CSV
         trial_split_csv = os.path.join(config["out_dir"], "trial_split_labels.csv")
@@ -879,9 +973,9 @@ def main():
             writer = _csv.writer(fcsv)
             writer.writerow(["trial", "split"])  # header
             for t in sorted(list(train_trial_ids)):
-                writer.writerow([t, "train"])
+                writer.writerow([str(t), "train"])  # ensure str
             for t in sorted(list(val_trial_ids)):
-                writer.writerow([t, "val"])
+                writer.writerow([str(t), "val"])  # ensure str
         print(f"Saved trial split labels to {trial_split_csv}")
     except Exception as e:
         print(f"Failed to save data split metadata or trial labels: {e}")
@@ -906,168 +1000,556 @@ def main():
         "data_split_constraints_met": split_meta['constraints_met']
     })
 
-    # NEW: build segments now that trials are split
+    # If split by windows, skip trial subset search and instead build a deterministic window-level split.
+    split_mode = str(config.get("split_mode", "trial")).lower()
     N = len(df)
     all_segments = compute_trial_segments(trials_arr, 0, N)
-    train_segments = filter_segments_by_trials(all_segments, trials_arr, train_trial_ids)
-    val_segments = filter_segments_by_trials(all_segments, trials_arr, val_trial_ids)
 
-    cfg = ChunkingConfig(window=config["window"], stride=config["stride"], drop_last=True)
+    if split_mode == "window":
+        # Build all valid window starts that do not cross trial boundaries and have full window length
+        all_starts = np.array(enumerate_stride_indices(all_segments, config["window"], config["stride"]), dtype=np.int64)
+        if all_starts.size == 0:
+            raise RuntimeError("No valid windows found for window-based split. Reduce window or adjust stride.")
+        # Deterministic permutation
+        rng = np.random.default_rng(config["seed"])  # deterministic
+        perm = rng.permutation(all_starts.size)
+        n_val = max(1, int(round(all_starts.size * float(config["val_split"]))))
+        val_starts = all_starts[perm[:n_val]]
+        train_starts = all_starts[perm[n_val:]]
 
-    # Determine number of train samples per epoch (default to stride-based count within train trials)
-    default_train_samples = count_stride_windows_in_segments(train_segments, window=config["window"], stride=config["stride"])
-    samples_per_epoch = config.get("train_samples_per_epoch") or default_train_samples
+        # Save window split metadata for reproducibility
+        window_split_json = os.path.join(config["out_dir"], "window_split.json")
+        window_split_csv = os.path.join(config["out_dir"], "window_split_labels.csv")
+        meta = {
+            "split_mode": "window",
+            "window": int(config["window"]),
+            "stride": int(config["stride"]),
+            "val_starts": val_starts.tolist(),
+            "train_starts": train_starts.tolist(),
+            "total_windows": int(all_starts.size),
+            "val_windows": int(val_starts.size),
+            "train_windows": int(train_starts.size),
+        }
+        with open(window_split_json, "w") as f:
+            json.dump(meta, f, indent=2)
+        # CSV with labels
+        import csv as _csv
+        with open(window_split_csv, "w", newline="") as fcsv:
+            writer = _csv.writer(fcsv)
+            writer.writerow(["start", "end", "trial", "split"])  # header
+            w = int(config["window"])
+            for s in train_starts:
+                writer.writerow([int(s), int(s + w), str(df[trial_col].iloc[int(s)]), "train"])
+            for s in val_starts:
+                writer.writerow([int(s), int(s + w), str(df[trial_col].iloc[int(s)]), "val"])
+        print(f"Saved window split to {window_split_json} and {window_split_csv}")
 
-    # Datasets
-    def build_random_train_ds(epoch_seed_offset: int = 0):
-        # Different RNG seed each epoch => different random sampling distribution of chunk starts.
-        return RandomWrenchPoseChunkDataset(
+        # Build datasets/loaders
+        default_train_samples = len(train_starts)
+        samples_per_epoch = config.get("train_samples_per_epoch") or default_train_samples
+
+        def build_random_train_ds(epoch_seed_offset: int = 0):
+            return RandomStartIndexChunkDataset(
+                df,
+                config["wrench_cols"],
+                config["pose_cols"],
+                config["label_cols"],
+                start_indices=train_starts,
+                window=config["window"],
+                samples_per_epoch=int(samples_per_epoch),
+                wrench_norm_mu=mu,
+                wrench_norm_sd=sd,
+                rng=np.random.default_rng(config["seed"] + epoch_seed_offset),
+            )
+
+        train_ds = build_random_train_ds(epoch_seed_offset=0)
+        val_ds = FixedStartIndexChunkDataset(
             df,
             config["wrench_cols"],
             config["pose_cols"],
             config["label_cols"],
+            start_indices=val_starts,
             window=config["window"],
             wrench_norm_mu=mu,
             wrench_norm_sd=sd,
-            start=0,
-            end=N,
-            trial_col=trial_col,
-            samples_per_epoch=int(samples_per_epoch),
-            rng=np.random.default_rng(config["seed"] + epoch_seed_offset),
-            allowed_trials=train_trial_ids,
         )
 
-    train_ds = build_random_train_ds(epoch_seed_offset=0)
-    val_ds = WrenchPoseChunkDataset(
-        df,
-        config["wrench_cols"],
-        config["pose_cols"],
-        config["label_cols"],
-        cfg,
-        mu,
-        sd,
-        start=0,
-        end=N,
-        trial_col=trial_col,
-        allowed_trials=val_trial_ids,
-    )
-
-    if len(train_ds) == 0 or len(val_ds) == 0:
-        raise RuntimeError(
-            f"Insufficient data after chunking. Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}. Try reducing window or val_split."
-        )
-
-    # For random dataset, shuffling isn't necessary; each __getitem__ draws a fresh random chunk.
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, drop_last=False)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TimeSeriesCNN(
-        input_dim=12,
-        hidden=config["cnn_hidden"],
-        layers=config["cnn_layers"],
-        kernel_size=config["cnn_kernel"],
-        dropout=config["cnn_dropout"],
-        dilation_base=config["cnn_dilation_base"],
-        bidirectional=config["cnn_bidirectional"],
-        num_tasks=6,
-    ).to(device)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
-    loss_fn = make_loss_fn(config)
-
-    # Load checkpoint if specified
-    start_epoch = 1
-    best_val = float("inf")
-    if config["continue_from"]:
-        checkpoint_path = find_checkpoint(config["out_dir"], config["continue_from"])
-        if checkpoint_path:
-            start_epoch, best_val = load_checkpoint(checkpoint_path, model, opt)
-        else:
-            print("Starting training from scratch")
-
-    print(
-        f"Train trials: {len(train_trial_ids)} | Val trials: {len(val_trial_ids)} | "
-        f"Train chunks/epoch: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}"
-    )
-    print(f"Input features: 12 (6 wrench + 6 relative pose) | window={config['window']} (fixed), random-chunk training enabled")
-
-    for epoch in range(start_epoch, config["epochs"] + 1):
-        # Optionally rebuild (resample) random training dataset each epoch with fresh RNG seed.
-        if config.get("resample_train_each_epoch", False) and epoch > start_epoch:
-            train_ds = build_random_train_ds(epoch_seed_offset=epoch)
-            train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
-        tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)
-        vl_loss, mae_per_dim, rmse_per_dim, mae_mean, rmse_mean = evaluate(model, val_loader, device, loss_fn)
-
-        wandb.log({
-            "epoch": epoch,
-            "train_loss": tr_loss,
-            "val_loss": vl_loss,
-            "mae_mean": mae_mean,
-            "rmse_mean": rmse_mean,
-            **{f"mae_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], mae_per_dim)},
-            **{f"rmse_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], rmse_per_dim)},
-        })
-
-        if (epoch % int(config.get("classify_every", 5))) == 0:
-            mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification(
-                model, val_loader, device, config["out_dir"], tuple(config.get("class_boundaries", [0.5, 0.75]))
+        if len(train_ds) == 0 or len(val_ds) == 0:
+            raise RuntimeError(
+                f"Insufficient data after window split. Train windows: {len(train_ds)}, Val windows: {len(val_ds)}."
             )
-            print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]} | 3-class_mean_acc={mean_acc3:.4f}")
-            print(f"Overall limit detection: TP={overall_metrics['TP']} FP={overall_metrics['FP']} TN={overall_metrics['TN']} FN={overall_metrics['FN']} | "
-                  f"Sens={overall_metrics['sensitivity']:.3f} Spec={overall_metrics['specificity']:.3f} Prec={overall_metrics['precision']:.3f} NPV={overall_metrics['npv']:.3f} Acc={overall_metrics['accuracy']:.3f}")
-            log_payload = {
-                "val_class_mean_acc": mean_acc,
-                **{f"val_class_acc_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc_per_dim)},
-                "confusion_matrix_img": wandb.Image(fig_path),
-                "classification_accuracy_3class": mean_acc3,
-                **{f"val_class_acc_3class_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
-                # Overall limit detection metrics
-                "overall_limit_confusion_matrix": wandb.Image(overall_metrics["fig_path"]),
-                "overall_limit_TP": overall_metrics["TP"],
-                "overall_limit_FP": overall_metrics["FP"],
-                "overall_limit_TN": overall_metrics["TN"],
-                "overall_limit_FN": overall_metrics["FN"],
-                "overall_limit_sensitivity": overall_metrics["sensitivity"],
-                "overall_limit_specificity": overall_metrics["specificity"],
-                "overall_limit_precision": overall_metrics["precision"],
-                "overall_limit_NPV": overall_metrics["npv"],
-                "overall_limit_accuracy": overall_metrics["accuracy"],
-            }
-            for lbl, paths in per_dim_plot_paths.items():
-                if "cm3" in paths:
-                    log_payload[f"val_3class_confusion_{lbl}"] = wandb.Image(paths["cm3"])
-                if "fpfn" in paths:
-                    log_payload[f"val_3class_fpfn_{lbl}"] = wandb.Image(paths["fpfn"])
-                if "accbar" in paths:
-                    log_payload[f"val_3class_accbar_{lbl}"] = wandb.Image(paths["accbar"])
-            wandb.log(log_payload)
 
-        is_best = vl_loss < best_val
-        if is_best:
-            best_val = vl_loss
-            best_path = os.path.join(config["out_dir"], "best_model_regression.pt")
-            torch.save({"model": model.state_dict(), "config": config}, best_path)
+        # For random dataset, shuffling isn't necessary; each __getitem__ draws a fresh random chunk.
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, drop_last=False)
 
-        if epoch % config["save_every"] == 0:
-            checkpoint_path = os.path.join(config["out_dir"], f"regression_checkpoint_epoch_{epoch}.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": opt.state_dict(),
-                "epoch": epoch,
-                "config": config,
-                "best_val": best_val
-            }, checkpoint_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = TimeSeriesCNN(
+            input_dim=12,
+            hidden=config["cnn_hidden"],
+            layers=config["cnn_layers"],
+            kernel_size=config["cnn_kernel"],
+            dropout=config["cnn_dropout"],
+            dilation_base=config["cnn_dilation_base"],
+            bidirectional=config["cnn_bidirectional"],
+            num_tasks=6,
+        ).to(device)
 
-            predictions_path = os.path.join(config["out_dir"], f"val_predictions_regression_epoch_{epoch}.csv")
-            evaluate_and_save_predictions(model, val_loader, device, predictions_path)
+        opt = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
+        loss_fn = make_loss_fn(config)
+
+        # Load checkpoint if specified
+        start_epoch = 1
+        best_val = float("inf")
+        if config["continue_from"]:
+            checkpoint_path = find_checkpoint(config["out_dir"], config["continue_from"])
+            if checkpoint_path:
+                start_epoch, best_val = load_checkpoint(checkpoint_path, model, opt)
+            else:
+                print("Starting training from scratch")
 
         print(
-            f"Epoch {epoch:02d} | train_loss={tr_loss:.6f} | val_loss={vl_loss:.6f} | "
-            f"mae_dim={[f'{a:.4f}' for a in mae_per_dim]} | rmse_dim={[f'{a:.4f}' for a in rmse_per_dim]} | "
-            f"mae_mean={mae_mean:.4f} rmse_mean={rmse_mean:.4f} | {'** saved **' if is_best else ''}"
+            f"Split mode: window | Train windows: {len(train_starts)} | Val windows: {len(val_starts)} | "
+            f"Train samples/epoch: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}"
         )
+        print(f"Input features: 12 (6 wrench + 6 relative pose) | window={config['window']} (fixed), random-chunk training enabled")
+
+        for epoch in range(start_epoch, config["epochs"] + 1):
+            # Optionally rebuild (resample) random training dataset each epoch with fresh RNG seed.
+            if config.get("resample_train_each_epoch", False) and epoch > start_epoch:
+                train_ds = build_random_train_ds(epoch_seed_offset=epoch)
+                train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
+            tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)
+            vl_loss, mae_per_dim, rmse_per_dim, mae_mean, rmse_mean = evaluate(model, val_loader, device, loss_fn)
+
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": tr_loss,
+                "val_loss": vl_loss,
+                "mae_mean": mae_mean,
+                "rmse_mean": rmse_mean,
+                **{f"mae_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], mae_per_dim)},
+                **{f"rmse_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], rmse_per_dim)},
+            })
+
+            if (epoch % int(config.get("classify_every", 5))) == 0:
+                mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification(
+                    model, val_loader, device, config["out_dir"], tuple(config.get("class_boundaries", [0.5, 0.75]))
+                )
+                print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]} | 3-class_mean_acc={mean_acc3:.4f}")
+                print(f"Overall limit detection: TP={overall_metrics['TP']} FP={overall_metrics['FP']} TN={overall_metrics['TN']} FN={overall_metrics['FN']} | "
+                      f"Sens={overall_metrics['sensitivity']:.3f} Spec={overall_metrics['specificity']:.3f} Prec={overall_metrics['precision']:.3f} NPV={overall_metrics['npv']:.3f} Acc={overall_metrics['accuracy']:.3f}")
+                log_payload = {
+                    "val_class_mean_acc": mean_acc,
+                    **{f"val_class_acc_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc_per_dim)},
+                    "confusion_matrix_img": wandb.Image(fig_path),
+                    "classification_accuracy_3class": mean_acc3,
+                    **{f"val_class_acc_3class_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
+                    # Overall limit detection metrics
+                    "overall_limit_confusion_matrix": wandb.Image(overall_metrics["fig_path"]),
+                    "overall_limit_TP": overall_metrics["TP"],
+                    "overall_limit_FP": overall_metrics["FP"],
+                    "overall_limit_TN": overall_metrics["TN"],
+                    "overall_limit_FN": overall_metrics["FN"],
+                    "overall_limit_sensitivity": overall_metrics["sensitivity"],
+                    "overall_limit_specificity": overall_metrics["specificity"],
+                    "overall_limit_precision": overall_metrics["precision"],
+                    "overall_limit_NPV": overall_metrics["npv"],
+                    "overall_limit_accuracy": overall_metrics["accuracy"],
+                }
+                for lbl, paths in per_dim_plot_paths.items():
+                    if "cm3" in paths:
+                        log_payload[f"val_3class_confusion_{lbl}"] = wandb.Image(paths["cm3"])
+                    if "fpfn" in paths:
+                        log_payload[f"val_3class_fpfn_{lbl}"] = wandb.Image(paths["fpfn"])
+                    if "accbar" in paths:
+                        log_payload[f"val_3class_accbar_{lbl}"] = wandb.Image(paths["accbar"])
+                wandb.log(log_payload)
+
+            is_best = vl_loss < best_val
+            if is_best:
+                best_val = vl_loss
+                best_path = os.path.join(config["out_dir"], "best_model_regression.pt")
+                torch.save({"model": model.state_dict(), "config": config}, best_path)
+
+            if epoch % config["save_every"] == 0:
+                checkpoint_path = os.path.join(config["out_dir"], f"regression_checkpoint_epoch_{epoch}.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "config": config,
+                    "best_val": best_val
+                }, checkpoint_path)
+
+                predictions_path = os.path.join(config["out_dir"], f"val_predictions_regression_epoch_{epoch}.csv")
+                evaluate_and_save_predictions(model, val_loader, device, predictions_path)
+
+            print(
+                f"Epoch {epoch:02d} | train_loss={tr_loss:.6f} | val_loss={vl_loss:.6f} | "
+                f"mae_dim={[f'{a:.4f}' for a in mae_per_dim]} | rmse_dim={[f'{a:.4f}' for a in rmse_per_dim]} | "
+                f"mae_mean={mae_mean:.4f} rmse_mean={rmse_mean:.4f} | {'** saved **' if is_best else ''}"
+            )
+        return  # end main early when split by window to avoid running trial-based path below
+
+    # ------------- existing TRIAL-BASED path -------------
+    # Precompute label arrays for efficiency
+    label_values = df[config["label_cols"]].values.astype(np.float32)
+    # Global stats used to normalize min/max differences (stable even if values near 0)
+    global_mins = label_values.min(axis=0)
+    global_maxs = label_values.max(axis=0)
+    global_ranges = np.maximum(global_maxs - global_mins, 1e-8)
+
+    def compute_ranges(indices: np.ndarray):
+        subset = label_values[indices]
+        mins = subset.min(axis=0)
+        maxs = subset.max(axis=0)
+        ranges = maxs - mins
+        return mins, maxs, ranges
+
+    best_subset = None
+    best_ratio_diff = float("inf")
+
+    trial_list = [str(t) for t in unique_trials]
+    n_trials = len(trial_list)
+
+    # Enumerate all subsets (except empty/full) – feasible (e.g. 2^15=32768)
+    for r in range(1, n_trials):
+        for combo in itertools.combinations(trial_list, r):
+            val_indices = np.concatenate([trial_to_indices[t] for t in combo])
+            val_len = len(val_indices)
+            val_ratio = val_len / total_len
+            # Check ratio tolerance first
+            if abs(val_ratio - target_val_ratio) / max(target_val_ratio, 1e-8) > ratio_tol:
+                continue
+            train_trials = [t for t in trial_list if t not in combo]
+            train_indices = np.concatenate([trial_to_indices[t] for t in train_trials])
+            # Compute min/max
+            train_mins, train_maxs, _ = compute_ranges(train_indices)
+            val_mins, val_maxs, _ = compute_ranges(val_indices)
+            # Relative min/max difference normalized by global range
+            rel_min_diff = np.abs(train_mins - val_mins) / global_ranges
+            rel_max_diff = np.abs(train_maxs - val_maxs) / global_ranges
+            if np.any(rel_min_diff > minmax_tol) or np.any(rel_max_diff > minmax_tol):
+                continue
+            # Candidate acceptable
+            ratio_diff = abs(val_ratio - target_val_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_subset = {
+                    "val_trials": set(combo),
+                    "train_trials": set(train_trials),
+                    "val_indices": val_indices,
+                    "train_indices": train_indices,
+                    "val_ratio": val_ratio,
+                    "train_mins": train_mins.tolist(),
+                    "train_maxs": train_maxs.tolist(),
+                    "val_mins": val_mins.tolist(),
+                    "val_maxs": val_maxs.tolist(),
+                    "rel_min_diff": rel_min_diff.tolist(),
+                    "rel_max_diff": rel_max_diff.tolist(),
+                }
+        if best_ratio_diff == 0:
+            break
+
+    if best_subset is None:
+        # Fallback: ratio only (ignore min/max), choose deterministic permutation like original method.
+        rng = np.random.default_rng(config["seed"])  # deterministic
+        perm = rng.permutation(len(unique_trials))
+        n_val_trials = max(1, int(math.ceil(len(unique_trials) * target_val_ratio)))
+        val_trial_ids = set(unique_trials[perm[:n_val_trials]])
+        train_trial_ids = set(unique_trials) - val_trial_ids
+        print("WARNING: Could not find trial subset satisfying ratio + min/max constraints; using ratio-only split.")
+        # Compute min/max and relative diffs for reporting
+        train_indices_fb = np.concatenate([trial_to_indices[str(t)] for t in train_trial_ids])
+        val_indices_fb = np.concatenate([trial_to_indices[str(t)] for t in val_trial_ids])
+        train_mins, train_maxs, _ = compute_ranges(train_indices_fb)
+        val_mins, val_maxs, _ = compute_ranges(val_indices_fb)
+        rel_min_diff_fb = np.abs(train_mins - val_mins) / global_ranges
+        rel_max_diff_fb = np.abs(train_maxs - val_maxs) / global_ranges
+        split_meta = {
+            "target_val_ratio": target_val_ratio,
+            "actual_val_ratio": float(len(val_indices_fb) / total_len),
+            "val_trials": sorted(list(val_trial_ids)),
+            "train_trials": sorted(list(train_trial_ids)),
+            "label_minmax": {
+                "global": {col: {"min": float(global_mins[i]), "max": float(global_maxs[i]), "range": float(global_ranges[i])}
+                            for i, col in enumerate(config["label_cols"])},
+                "train": {col: {"min": float(train_mins[i]), "max": float(train_maxs[i])}
+                           for i, col in enumerate(config["label_cols"])},
+                "val": {col: {"min": float(val_mins[i]), "max": float(val_maxs[i])}
+                         for i, col in enumerate(config["label_cols"])},
+                "relative_min_diff": {col: float(rel_min_diff_fb[i]) for i, col in enumerate(config["label_cols"])},
+                "relative_max_diff": {col: float(rel_max_diff_fb[i]) for i, col in enumerate(config["label_cols"])},
+            },
+            "constraints_met": False
+        }
+    else:
+        val_trial_ids = set(best_subset["val_trials"])
+        train_trial_ids = set(best_subset["train_trials"])
+        split_meta = {
+            "target_val_ratio": target_val_ratio,
+            "actual_val_ratio": best_subset["val_ratio"],
+            "val_trials": sorted(list(val_trial_ids)),
+            "train_trials": sorted(list(train_trial_ids)),
+            "label_minmax": {
+                "global": {col: {"min": float(global_mins[i]), "max": float(global_maxs[i]), "range": float(global_ranges[i])}
+                            for i, col in enumerate(config["label_cols"])},
+                "train": {col: {"min": float(best_subset["train_mins"][i]), "max": float(best_subset["train_maxs"][i])}
+                           for i, col in enumerate(config["label_cols"])},
+                "val": {col: {"min": float(best_subset["val_mins"][i]), "max": float(best_subset["val_maxs"][i])}
+                         for i, col in enumerate(config["label_cols"])},
+                "relative_min_diff": {col: float(best_subset["rel_min_diff"][i]) for i, col in enumerate(config["label_cols"])},
+                "relative_max_diff": {col: float(best_subset["rel_max_diff"][i]) for i, col in enumerate(config["label_cols"])},
+            },
+            "constraints_met": True
+        }
+
+    # Persist split metadata for reproducibility (used by eval script)
+    split_path = os.path.join(config["out_dir"], "data_split.json")
+    try:
+        # Ensure trials are JSON-serializable (convert any numpy types to str)
+        split_meta["val_trials"] = [str(t) for t in split_meta["val_trials"]]
+        split_meta["train_trials"] = [str(t) for t in split_meta["train_trials"]]
+
+        class _NpEncoder(json.JSONEncoder):
+            def default(self, obj):  # type: ignore
+                import numpy as _np
+                if isinstance(obj, (_np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (_np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (_np.ndarray,)):
+                    return obj.tolist()
+                return super().default(obj)
+
+        with open(split_path, "w") as f:
+            json.dump(split_meta, f, indent=2, cls=_NpEncoder)
+        print(f"Saved data split metadata to {split_path}")
+        # NEW: write trial-level split labels CSV
+        trial_split_csv = os.path.join(config["out_dir"], "trial_split_labels.csv")
+        import csv as _csv
+        with open(trial_split_csv, "w", newline="") as fcsv:
+            writer = _csv.writer(fcsv)
+            writer.writerow(["trial", "split"])  # header
+            for t in sorted(list(train_trial_ids)):
+                writer.writerow([str(t), "train"])  # ensure str
+            for t in sorted(list(val_trial_ids)):
+                writer.writerow([str(t), "val"])  # ensure str
+        print(f"Saved trial split labels to {trial_split_csv}")
+    except Exception as e:
+        print(f"Failed to save data split metadata or trial labels: {e}")
+
+    print(f"Selected val trials ({len(val_trial_ids)}): {sorted(list(val_trial_ids))}")
+    print(f"Selected train trials ({len(train_trial_ids)}): {sorted(list(train_trial_ids))}")
+    print(f"Actual val ratio: {split_meta['actual_val_ratio']:.4f} (target={target_val_ratio:.4f}) | constraints_met={split_meta['constraints_met']}")
+    for i, col in enumerate(config["label_cols"]):
+        tmin = split_meta["label_minmax"]["train"][col]["min"]
+        tmax = split_meta["label_minmax"]["train"][col]["max"]
+        vmin = split_meta["label_minmax"]["val"][col]["min"]
+        vmax = split_meta["label_minmax"]["val"][col]["max"]
+        rmin = split_meta["label_minmax"]["relative_min_diff"][col]
+        rmax = split_meta["label_minmax"]["relative_max_diff"][col]
+        print(f"{col}: train[min,max]=({tmin:.4f},{tmax:.4f}) | val[min,max]=({vmin:.4f},{vmax:.4f}) | rel_min_diff={rmin:.4f} rel_max_diff={rmax:.4f}")
+
+    # Optionally log to wandb once
+    wandb.log({
+        "data_split_actual_val_ratio": split_meta['actual_val_ratio'],
+        **{f"data_split_rel_min_diff_{col}": split_meta['label_minmax']['relative_min_diff'][col] for col in config['label_cols']},
+        **{f"data_split_rel_max_diff_{col}": split_meta['label_minmax']['relative_max_diff'][col] for col in config['label_cols']},
+        "data_split_constraints_met": split_meta['constraints_met']
+    })
+
+    # If split by windows, skip trial subset search and instead build a deterministic window-level split.
+    split_mode = str(config.get("split_mode", "trial")).lower()
+    N = len(df)
+    all_segments = compute_trial_segments(trials_arr, 0, N)
+
+    if split_mode == "window":
+        # Build all valid window starts that do not cross trial boundaries and have full window length
+        all_starts = np.array(enumerate_stride_indices(all_segments, config["window"], config["stride"]), dtype=np.int64)
+        if all_starts.size == 0:
+            raise RuntimeError("No valid windows found for window-based split. Reduce window or adjust stride.")
+        # Deterministic permutation
+        rng = np.random.default_rng(config["seed"])  # deterministic
+        perm = rng.permutation(all_starts.size)
+        n_val = max(1, int(round(all_starts.size * float(config["val_split"]))))
+        val_starts = all_starts[perm[:n_val]]
+        train_starts = all_starts[perm[n_val:]]
+
+        # Save window split metadata for reproducibility
+        window_split_json = os.path.join(config["out_dir"], "window_split.json")
+        window_split_csv = os.path.join(config["out_dir"], "window_split_labels.csv")
+        meta = {
+            "split_mode": "window",
+            "window": int(config["window"]),
+            "stride": int(config["stride"]),
+            "val_starts": val_starts.tolist(),
+            "train_starts": train_starts.tolist(),
+            "total_windows": int(all_starts.size),
+            "val_windows": int(val_starts.size),
+            "train_windows": int(train_starts.size),
+        }
+        with open(window_split_json, "w") as f:
+            json.dump(meta, f, indent=2)
+        # CSV with labels
+        import csv as _csv
+        with open(window_split_csv, "w", newline="") as fcsv:
+            writer = _csv.writer(fcsv)
+            writer.writerow(["start", "end", "trial", "split"])  # header
+            w = int(config["window"])
+            for s in train_starts:
+                writer.writerow([int(s), int(s + w), str(df[trial_col].iloc[int(s)]), "train"])
+            for s in val_starts:
+                writer.writerow([int(s), int(s + w), str(df[trial_col].iloc[int(s)]), "val"])
+        print(f"Saved window split to {window_split_json} and {window_split_csv}")
+
+        # Build datasets/loaders
+        default_train_samples = len(train_starts)
+        samples_per_epoch = config.get("train_samples_per_epoch") or default_train_samples
+
+        def build_random_train_ds(epoch_seed_offset: int = 0):
+            return RandomStartIndexChunkDataset(
+                df,
+                config["wrench_cols"],
+                config["pose_cols"],
+                config["label_cols"],
+                start_indices=train_starts,
+                window=config["window"],
+                samples_per_epoch=int(samples_per_epoch),
+                wrench_norm_mu=mu,
+                wrench_norm_sd=sd,
+                rng=np.random.default_rng(config["seed"] + epoch_seed_offset),
+            )
+
+        train_ds = build_random_train_ds(epoch_seed_offset=0)
+        val_ds = FixedStartIndexChunkDataset(
+            df,
+            config["wrench_cols"],
+            config["pose_cols"],
+            config["label_cols"],
+            start_indices=val_starts,
+            window=config["window"],
+            wrench_norm_mu=mu,
+            wrench_norm_sd=sd,
+        )
+
+        if len(train_ds) == 0 or len(val_ds) == 0:
+            raise RuntimeError(
+                f"Insufficient data after window split. Train windows: {len(train_ds)}, Val windows: {len(val_ds)}."
+            )
+
+        # For random dataset, shuffling isn't necessary; each __getitem__ draws a fresh random chunk.
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, drop_last=False)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = TimeSeriesCNN(
+            input_dim=12,
+            hidden=config["cnn_hidden"],
+            layers=config["cnn_layers"],
+            kernel_size=config["cnn_kernel"],
+            dropout=config["cnn_dropout"],
+            dilation_base=config["cnn_dilation_base"],
+            bidirectional=config["cnn_bidirectional"],
+            num_tasks=6,
+        ).to(device)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-4)
+        loss_fn = make_loss_fn(config)
+
+        # Load checkpoint if specified
+        start_epoch = 1
+        best_val = float("inf")
+        if config["continue_from"]:
+            checkpoint_path = find_checkpoint(config["out_dir"], config["continue_from"])
+            if checkpoint_path:
+                start_epoch, best_val = load_checkpoint(checkpoint_path, model, opt)
+            else:
+                print("Starting training from scratch")
+
+        print(
+            f"Split mode: window | Train windows: {len(train_starts)} | Val windows: {len(val_starts)} | "
+            f"Train samples/epoch: {len(train_ds)} | Val chunks: {len(val_ds)} | Device: {device}"
+        )
+        print(f"Input features: 12 (6 wrench + 6 relative pose) | window={config['window']} (fixed), random-chunk training enabled")
+
+        for epoch in range(start_epoch, config["epochs"] + 1):
+            # Optionally rebuild (resample) random training dataset each epoch with fresh RNG seed.
+            if config.get("resample_train_each_epoch", False) and epoch > start_epoch:
+                train_ds = build_random_train_ds(epoch_seed_offset=epoch)
+                train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=False, drop_last=True)
+            tr_loss = train_one_epoch(model, train_loader, opt, device, loss_fn)
+            vl_loss, mae_per_dim, rmse_per_dim, mae_mean, rmse_mean = evaluate(model, val_loader, device, loss_fn)
+
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": tr_loss,
+                "val_loss": vl_loss,
+                "mae_mean": mae_mean,
+                "rmse_mean": rmse_mean,
+                **{f"mae_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], mae_per_dim)},
+                **{f"rmse_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], rmse_per_dim)},
+            })
+
+            if (epoch % int(config.get("classify_every", 5))) == 0:
+                mean_acc, acc_per_dim, cm, fig_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification(
+                    model, val_loader, device, config["out_dir"], tuple(config.get("class_boundaries", [0.5, 0.75]))
+                )
+                print(f"Val classification mean accuracy: {mean_acc:.4f} | per-dim={[f'{a:.4f}' for a in acc_per_dim]} | 3-class_mean_acc={mean_acc3:.4f}")
+                print(f"Overall limit detection: TP={overall_metrics['TP']} FP={overall_metrics['FP']} TN={overall_metrics['TN']} FN={overall_metrics['FN']} | "
+                      f"Sens={overall_metrics['sensitivity']:.3f} Spec={overall_metrics['specificity']:.3f} Prec={overall_metrics['precision']:.3f} NPV={overall_metrics['npv']:.3f} Acc={overall_metrics['accuracy']:.3f}")
+                log_payload = {
+                    "val_class_mean_acc": mean_acc,
+                    **{f"val_class_acc_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc_per_dim)},
+                    "confusion_matrix_img": wandb.Image(fig_path),
+                    "classification_accuracy_3class": mean_acc3,
+                    **{f"val_class_acc_3class_{label}": val for label, val in zip(["X","Y","Z","A","B","C"], acc3_per_dim)},
+                    # Overall limit detection metrics
+                    "overall_limit_confusion_matrix": wandb.Image(overall_metrics["fig_path"]),
+                    "overall_limit_TP": overall_metrics["TP"],
+                    "overall_limit_FP": overall_metrics["FP"],
+                    "overall_limit_TN": overall_metrics["TN"],
+                    "overall_limit_FN": overall_metrics["FN"],
+                    "overall_limit_sensitivity": overall_metrics["sensitivity"],
+                    "overall_limit_specificity": overall_metrics["specificity"],
+                    "overall_limit_precision": overall_metrics["precision"],
+                    "overall_limit_NPV": overall_metrics["npv"],
+                    "overall_limit_accuracy": overall_metrics["accuracy"],
+                }
+                for lbl, paths in per_dim_plot_paths.items():
+                    if "cm3" in paths:
+                        log_payload[f"val_3class_confusion_{lbl}"] = wandb.Image(paths["cm3"])
+                    if "fpfn" in paths:
+                        log_payload[f"val_3class_fpfn_{lbl}"] = wandb.Image(paths["fpfn"])
+                    if "accbar" in paths:
+                        log_payload[f"val_3class_accbar_{lbl}"] = wandb.Image(paths["accbar"])
+                wandb.log(log_payload)
+
+            is_best = vl_loss < best_val
+            if is_best:
+                best_val = vl_loss
+                best_path = os.path.join(config["out_dir"], "best_model_regression.pt")
+                torch.save({"model": model.state_dict(), "config": config}, best_path)
+
+            if epoch % config["save_every"] == 0:
+                checkpoint_path = os.path.join(config["out_dir"], f"regression_checkpoint_epoch_{epoch}.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "config": config,
+                    "best_val": best_val
+                }, checkpoint_path)
+
+                predictions_path = os.path.join(config["out_dir"], f"val_predictions_regression_epoch_{epoch}.csv")
+                evaluate_and_save_predictions(model, val_loader, device, predictions_path)
+
+            print(
+                f"Epoch {epoch:02d} | train_loss={tr_loss:.6f} | val_loss={vl_loss:.6f} | "
+                f"mae_dim={[f'{a:.4f}' for a in mae_per_dim]} | rmse_dim={[f'{a:.4f}' for a in rmse_per_dim]} | "
+                f"mae_mean={mae_mean:.4f} rmse_mean={rmse_mean:.4f} | {'** saved **' if is_best else ''}"
+            )
 
 
 if __name__ == "__main__":

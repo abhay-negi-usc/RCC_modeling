@@ -504,19 +504,23 @@ def main():
     boundaries = [0.75,0.9] # use this for original paper results
     b0 = float(boundaries[0])  # inner boundary controls neutral region size
     b1 = float(boundaries[1])  # outer boundary for far class thresholds
+    b1_h, b1_l = b1, -b1
+    b1_h_with_margin = b1 - EVAL_CONFIG.get("persistence_margin", 0.0)
+    b1_l_with_margin = -b1 + EVAL_CONFIG.get("persistence_margin", 0.0)
     out_dir = ckpt_config["out_dir"]
     eval_dir = os.path.join(out_dir, "eval_results")
     os.makedirs(eval_dir, exist_ok=True)
     # Use eval_dir for downstream artifacts
     _buf = EVAL_CONFIG.get("exclude_boundary_buffer")
     _mode = EVAL_CONFIG.get("exclude_boundary_mode", "any")
+    margin = EVAL_CONFIG.get("persistence_margin", None)
     if _buf is not None and float(_buf) > 0:
         mean_acc5, acc5_per_dim, cm5, cm5_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification_filtered(
             model, val_loader, device, eval_dir, boundaries, filter_buffer=float(_buf), filter_mode=_mode
         )
     else:
         mean_acc5, acc5_per_dim, cm5, cm5_path, mean_acc3, acc3_per_dim, per_dim_plot_paths, overall_metrics = evaluate_classification(
-            model, val_loader, device, eval_dir, boundaries
+            model, val_loader, device, eval_dir, boundaries, margin
         )
 
     # Extract raw predictions and GT once for PR sweep (reuse evaluate_and_save_predictions style logic)
@@ -567,7 +571,7 @@ def main():
         neutral_high = b0 
         neutral_low_with_margin = -b0 + margin_main
         neutral_high_with_margin = b0 - margin_main
-        pred_outside = ((P_eval <= neutral_low) | (P_eval >= neutral_high)).any(axis=1)
+        pred_outside = ((P_eval <= neutral_low_with_margin) | (P_eval >= neutral_high_with_margin)).any(axis=1)
         gt_outside = ((G_eval <= neutral_low) | (G_eval >= neutral_high)).any(axis=1)
         TP = int(np.sum(pred_outside & gt_outside))
         TN = int(np.sum(~pred_outside & ~gt_outside))
@@ -639,8 +643,9 @@ def main():
     aggregated_5class_cm_paths_by_margin = {}
     dim_labels_margin = ["X","Y","Z","Roll","Pitch","Yaw"]
     for m in pr_margins:
-        nl, nh = -b0 + float(m), b0 - float(m)
-        pred_outside_any = ((P_eval <= nl) | (P_eval >= nh)).any(axis=1)
+        nl, nh = -b0, b0 
+        nl_with_margin, nh_with_margin = -b0 + float(m), b0 - float(m)
+        pred_outside_any = ((P_eval <= nl_with_margin) | (P_eval >= nh_with_margin)).any(axis=1)
         gt_outside_any = ((G_eval <= nl) | (G_eval >= nh)).any(axis=1)
         TP = int(np.sum(pred_outside_any & gt_outside_any))
         TN = int(np.sum(~pred_outside_any & ~gt_outside_any))
@@ -670,7 +675,7 @@ def main():
         fig_b, axes_b = plt.subplots(2, 3, figsize=(12, 7))
         axes_bf = axes_b.flatten()
         for d, lbl in enumerate(dim_labels_margin):
-            pred_out_d = (P_eval[:, d] <= nl) | (P_eval[:, d] >= nh)
+            pred_out_d = (P_eval[:, d] <= nl_with_margin) | (P_eval[:, d] >= nh_with_margin)
             gt_out_d = (G_eval[:, d] <= nl) | (G_eval[:, d] >= nh)
             TPd = int(np.sum(pred_out_d & gt_out_d))
             TNd = int(np.sum(~pred_out_d & ~gt_out_d))
@@ -702,7 +707,7 @@ def main():
         for d, lbl in enumerate(dim_labels_margin):
             pred_vals = P_eval[:, d]
             gt_vals = G_eval[:, d]
-            pred_c = np.where(pred_vals <= nl, 0, np.where(pred_vals >= nh, 2, 1))
+            pred_c = np.where(pred_vals <= nl_with_margin, 0, np.where(pred_vals >= nh_with_margin, 2, 1))
             gt_c = np.where(gt_vals <= nl, 0, np.where(gt_vals >= nh, 2, 1))
             cm3 = np.zeros((3,3), dtype=np.int64)
             for t, p in zip(gt_c, pred_c):
@@ -735,15 +740,16 @@ def main():
             gt_vals = G_eval[:, d]
             # Map to 5 classes with neutral band shrunk by margin m
             # Far thresholds use b1; near thresholds use (b0 - m)
-            nl, nh = -b0 + float(m), b0 - float(m)
-            pred_c5 = np.where(pred_vals <= -b1, 0,
-                        np.where(pred_vals <= nl, 1,
-                        np.where(pred_vals <  nh, 2,
-                        np.where(pred_vals <  b1, 3, 4))))
-            gt_c5 = np.where(gt_vals <= -b1, 0,
+            nl, nh = -b0, b0 
+            nl_with_margin, nh_with_margin = -b0 + float(m), b0 - float(m)
+            pred_c5 = np.where(pred_vals <= b1_l_with_margin, 0,
+                        np.where(pred_vals <= nl_with_margin, 1,
+                        np.where(pred_vals <  nh_with_margin, 2,
+                        np.where(pred_vals <  b1_h_with_margin, 3, 4))))
+            gt_c5 = np.where(gt_vals <= b1_l, 0,
                      np.where(gt_vals <= nl, 1,
                      np.where(gt_vals <  nh, 2,
-                     np.where(gt_vals <  b1, 3, 4))))
+                     np.where(gt_vals <  b1_h, 3, 4))))
             cm5 = np.zeros((5,5), dtype=np.int64)
             for t, p in zip(gt_c5, pred_c5):
                 cm5[t, p] += 1
@@ -769,14 +775,14 @@ def main():
         combined_dim_5class_cm_paths_by_margin[float(m)] = combined_cm5_path
 
         # NEW: Aggregated 5-class confusion across all dimensions using margin-based neutral band
-        pred_c5_all = np.where(P_eval <= -b1, 0,
+        pred_c5_all = np.where(P_eval <= b1_l_with_margin, 0,
                         np.where(P_eval <= nl, 1,
                         np.where(P_eval <  nh, 2,
-                        np.where(P_eval <  b1, 3, 4))))
-        gt_c5_all = np.where(G_eval <= -b1, 0,
+                        np.where(P_eval <  b1_h_with_margin, 3, 4))))
+        gt_c5_all = np.where(G_eval <= b1_l, 0,
                       np.where(G_eval <= nl, 1,
                       np.where(G_eval <  nh, 2,
-                      np.where(G_eval <  b1, 3, 4))))
+                      np.where(G_eval <  b1_h, 3, 4))))
         P5 = pred_c5_all.reshape(-1)
         G5 = gt_c5_all.reshape(-1)
         cm5_agg = np.zeros((5,5), dtype=np.int64)
@@ -808,7 +814,7 @@ def main():
         for d, lbl in enumerate(dim_labels_margin):
             pred_vals = P_eval[:, d]
             gt_vals = G_eval[:, d]
-            pred_c = np.where(pred_vals <= nl, 0, np.where(pred_vals >= nh, 2, 1))
+            pred_c = np.where(pred_vals <= nl_with_margin, 0, np.where(pred_vals >= nh_with_margin, 2, 1))
             gt_c = np.where(gt_vals <= nl, 0, np.where(gt_vals >= nh, 2, 1))
             cm3 = np.zeros((3,3), dtype=np.int64)
             for t, p in zip(gt_c, pred_c):
@@ -841,8 +847,9 @@ def main():
         pts = []
         for m in pr_margins:
             # element-wise per-dimension decision
-            nl, nh = -b0 + m, b0 - m
-            pred_out = (P_eval[:, d] <= nl) | (P_eval[:, d] >= nh)
+            nl, nh = -b0, b0 
+            nl_with_margin, nh_with_margin = -b0 + m, b0 - m
+            pred_out = (P_eval[:, d] <= nl_with_margin) | (P_eval[:, d] >= nh_with_margin)
             gt_out = (G_eval[:, d] <= nl) | (G_eval[:, d] >= nh)
             TP = int(np.sum(pred_out & gt_out))
             TN = int(np.sum(~pred_out & ~gt_out))
@@ -858,8 +865,9 @@ def main():
     P_flat = P_eval.reshape(-1)
     G_flat = G_eval.reshape(-1)
     for m in pr_margins:
-        nl, nh = -b0 + m, b0 - m
-        pred_out = (P_flat <= nl) | (P_flat >= nh)
+        nl, nh = -b0, b0 
+        nl_with_margin, nh_with_margin = -b0 + m, b0 - m
+        pred_out = (P_flat <= nl_with_margin) | (P_flat >= nh_with_margin)
         gt_out = (G_flat <= nl) | (G_flat >= nh)
         TP = int(np.sum(pred_out & gt_out))
         TN = int(np.sum(~pred_out & ~gt_out))
@@ -1240,9 +1248,10 @@ def main():
 
         # Use filtered gt_peak_vals/pr_peak_vals for margin sweeps and metrics
         for m in pr_margins:
-            nl, nh = -b0 + float(m), b0 - float(m)
+            nl, nh = -b0, b0 
+            nl_with_margin, nh_with_margin = -b0 + float(m), b0 - float(m)
             # Overall any-dim exceedance at chunk level
-            pred_out_any = ((pr_peak_vals <= nl) | (pr_peak_vals >= nh)).any(axis=1)
+            pred_out_any = ((pr_peak_vals <= nl_with_margin) | (pr_peak_vals >= nh_with_margin)).any(axis=1)
             gt_out_any = ((gt_peak_vals <= nl) | (gt_peak_vals >= nh)).any(axis=1)
             TP = int(np.sum(pred_out_any & gt_out_any))
             TN = int(np.sum(~pred_out_any & ~gt_out_any))
@@ -1272,7 +1281,7 @@ def main():
             fig_b, axes_b = plt.subplots(2, 3, figsize=(12, 7))
             axes_bf = axes_b.flatten()
             for d, lbl in enumerate(dim_labels):
-                pred_out_d = (pr_peak_vals[:, d] <= nl) | (pr_peak_vals[:, d] >= nh)
+                pred_out_d = (pr_peak_vals[:, d] <= nl_with_margin) | (pr_peak_vals[:, d] >= nh_with_margin)
                 gt_out_d = (gt_peak_vals[:, d] <= nl) | (gt_peak_vals[:, d] >= nh)
                 TPd = int(np.sum(pred_out_d & gt_out_d))
                 TNd = int(np.sum(~pred_out_d & ~gt_out_d))
@@ -1303,16 +1312,16 @@ def main():
             for d, lbl in enumerate(dim_labels_margin):
                 pred_vals = pr_peak_vals[:, d]
                 gt_vals = gt_peak_vals[:, d]
-                pred_c = np.where(pred_vals <= nl, 0, np.where(pred_vals >= nh, 2, 1))
+                pred_c = np.where(pred_vals <= nl_with_margin, 0, np.where(pred_vals >= nh_with_margin, 2, 1))
                 gt_c = np.where(gt_vals <= nl, 0, np.where(gt_vals >= nh, 2, 1))
                 cm3_d = np.zeros((3,3), dtype=np.int64)
                 for t, p in zip(gt_c, pred_c):
                     cm3_d[t, p] += 1
                 rs3 = cm3_d.sum(axis=1, keepdims=True)
                 cm3_norm = np.where(rs3>0, cm3_d/rs3, 0.0)
-                annot = np.array([[f"{cm3[0,0]}\n{cm3_norm[0,0]:.2f}", f"{cm3[0,1]}\n{cm3_norm[0,1]:.2f}", f"{cm3[0,2]}\n{cm3_norm[0,2]:.2f}"],
-                                  [f"{cm3[1,0]}\n{cm3_norm[1,0]:.2f}", f"{cm3[1,1]}\n{cm3_norm[1,1]:.2f}", f"{cm3[1,2]}\n{cm3_norm[1,2]:.2f}"],
-                                  [f"{cm3[2,0]}\n{cm3_norm[2,0]:.2f}", f"{cm3[2,1]}\n{cm3_norm[2,1]:.2f}", f"{cm3[2,2]}\n{cm3_norm[2,2]:.2f}"]])
+                annot = np.array([[f"{cm3_d[0,0]}\n{cm3_norm[0,0]:.2f}", f"{cm3_d[0,1]}\n{cm3_norm[0,1]:.2f}", f"{cm3_d[0,2]}\n{cm3_norm[0,2]:.2f}"],
+                                  [f"{cm3_d[1,0]}\n{cm3_norm[1,0]:.2f}", f"{cm3_d[1,1]}\n{cm3_norm[1,1]:.2f}", f"{cm3_d[1,2]}\n{cm3_norm[1,2]:.2f}"],
+                                  [f"{cm3_d[2,0]}\n{cm3_norm[2,0]:.2f}", f"{cm3_d[2,1]}\n{cm3_norm[2,1]:.2f}", f"{cm3_d[2,2]}\n{cm3_norm[2,2]:.2f}"]])
                 axc = axes_c3f[d]
                 sns.heatmap(cm3_norm, ax=axc, annot=annot, fmt="", cmap="Blues", vmin=0.0, vmax=1.0, cbar=False)
                 axc.set_title(f"{lbl}")
@@ -1334,18 +1343,19 @@ def main():
             class_names_5c = ["-2","-1","0","+1","+2"]
             fig_c5, axes_c5 = plt.subplots(2, 3, figsize=(12, 7))
             axes_c5f = axes_c5.flatten()
-            nl, nh = -b0 + float(m), b0 - float(m)
+            nl, nh = -b0, b0 
+            nl_with_margin, nh_with_margin = -b0 + float(m), b0 - float(m)
             for d, lbl in enumerate(dim_labels_margin):
                 pred_vals = pr_peak_vals[:, d]
                 gt_vals = gt_peak_vals[:, d]
-                pred_c5 = np.where(pred_vals <= -b1, 0,
-                            np.where(pred_vals <= nl, 1,
-                            np.where(pred_vals <  nh, 2,
-                            np.where(pred_vals <  b1, 3, 4))))
-                gt_c5 = np.where(gt_vals <= -b1, 0,
+                pred_c5 = np.where(pred_vals <= b1_l_with_margin, 0,
+                            np.where(pred_vals <= nl_with_margin, 1,
+                            np.where(pred_vals <  nh_with_margin, 2,
+                            np.where(pred_vals <  b1_h_with_margin, 3, 4))))
+                gt_c5 = np.where(gt_vals <= b1_l, 0,
                           np.where(gt_vals <= nl, 1,
                           np.where(gt_vals <  nh, 2,
-                          np.where(gt_vals <  b1, 3, 4))))
+                          np.where(gt_vals <  b1_h, 3, 4))))
                 cm5_d = np.zeros((5,5), dtype=np.int64)
                 for t, p in zip(gt_c5, pred_c5):
                     cm5_d[t, p] += 1
@@ -1367,10 +1377,10 @@ def main():
             chunk_combined_dim_5class_cm_paths_by_margin[float(m)] = out_c5
 
             # NEW: Aggregated 5-class confusion across dims for chunks
-            pred_c5_all = np.where(pr_peak_vals <= -b1, 0,
+            pred_c5_all = np.where(pr_peak_vals <= b1_l_with_margin, 0,
                             np.where(pr_peak_vals <= nl, 1,
                             np.where(pr_peak_vals <  nh, 2,
-                            np.where(pr_peak_vals <  b1, 3, 4))))
+                            np.where(pr_peak_vals <  b1_h_with_margin, 3, 4))))
             gt_c5_all = np.where(gt_peak_vals <= -b1, 0,
                       np.where(gt_peak_vals <= nl, 1,
                       np.where(gt_peak_vals <  nh, 2,
@@ -1408,9 +1418,10 @@ def main():
         # Also save per-chunk 3-class predictions for margin_main (if provided)
         chunk_margin_predictions_csv = None
         if margin_main is not None:
-            nl_main, nh_main = -b0 + float(margin_main), b0 - float(margin_main)
+            nl_main, nh_main = -b0, b0
+            nl_main_with_margin, nh_main_with_margin = -b0 + float(margin_main), b0 - float(margin_main)
             # 3-class mapping using margin_main neutral band
-            gt_c_margin = np.where(gt_peak_vals <= nl_main, 0, np.where(gt_peak_vals >= nh_main, 2, 1))  # shape [kept_chunks,6]
+            gt_c_margin = np.where(gt_peak_vals <= nl_main_with_margin, 0, np.where(gt_peak_vals >= nh_main_with_margin, 2, 1))  # shape [kept_chunks,6]
             pr_margins = np.where(pr_peak_vals <= nl_main, 0, np.where(pr_peak_vals >= nh_main, 2, 1))
             # Save CSV: chunk_index plus GT_/Pred_ per dim (indices refer to filtered ordering)
             chunk_margin_predictions_csv = os.path.join(chunk_eval_dir, f"chunk_margin_{margin_main:.3f}_predictions.csv")
@@ -1587,16 +1598,16 @@ def main():
 
             # Masks per sign and band for the whole chunk tensor [C,W,6]
             # Near (inner, sign-aware, margin applied)
-            gt_near_neg = (G_ch <  (-b0 + m))
-            gt_near_pos = (G_ch >  ( b0 - m))
+            gt_near_neg = (G_ch <  (-b0))
+            gt_near_pos = (G_ch >  ( b0))
             pr_near_neg = (P_ch <  (-b0 + m))
             pr_near_pos = (P_ch >  ( b0 - m))
 
             # Far (outer, sign-aware, no margin)
             gt_far_neg  = (G_ch <= (-b1))
             gt_far_pos  = (G_ch >= ( b1))
-            pr_far_neg  = (P_ch <= (-b1))
-            pr_far_pos  = (P_ch >= ( b1))
+            pr_far_neg  = (P_ch <= (-b1 + m))
+            pr_far_pos  = (P_ch >= ( b1 - m))
 
             # Build per-chunk, per-dim 5-class labels with persistence (K-run)
             def _label_5class_from_masks(near_neg_row, far_neg_row, near_pos_row, far_pos_row, K):

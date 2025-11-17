@@ -471,7 +471,8 @@ def collapse_to_3class(c5: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
-def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5, 0.75)):
+def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5, 0.75), margin=0.0):
+    boundaries_with_margin = (boundaries[0] - margin, boundaries[1] - margin)
     model.eval()
     preds_list = []
     gts_list = []
@@ -504,7 +505,7 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     per_dim_plot_paths = {lbl: {} for lbl in dim_labels}
 
     for d, lbl in enumerate(dim_labels):
-        pred_c5 = map_norm_to_class(P[:, d], boundaries)
+        pred_c5 = map_norm_to_class(P[:, d], boundaries_with_margin)
         gt_c5 = map_norm_to_class(G[:, d], boundaries)
         acc = float((pred_c5 == gt_c5).mean())
         acc_per_dim.append(acc)
@@ -512,7 +513,6 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
         gt_c3 = collapse_to_3class(gt_c5)
         acc3 = float((pred_c3 == gt_c3).mean())
         acc3_per_dim.append(acc3)
-
         num_c3 = 3
         cm3 = np.zeros((num_c3, num_c3), dtype=np.int64)
         for t, p in zip(gt_c3, pred_c3):
@@ -580,7 +580,7 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     mean_acc3 = float(np.mean(acc3_per_dim))
 
     # Aggregated 5-class confusion matrix (unchanged logic)
-    pred_all = map_norm_to_class(P, boundaries).reshape(-1)
+    pred_all = map_norm_to_class(P, boundaries_with_margin).reshape(-1)
     gt_all = map_norm_to_class(G, boundaries).reshape(-1)
     num_classes = 5
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -608,7 +608,7 @@ def evaluate_classification(model, loader, device, out_dir: str, boundaries=(0.5
     # NEW: Overall limit detection confusion matrix & metrics
     # Positive iff ANY dimension is non-neutral (class != 2). Negative iff ALL are neutral.
     # ----------------------------
-    pred_c5_matrix = map_norm_to_class(P, boundaries)  # shape [N,6]
+    pred_c5_matrix = map_norm_to_class(P, boundaries_with_margin)  # shape [N,6]
     gt_c5_matrix = map_norm_to_class(G, boundaries)
     gt_pos = (gt_c5_matrix != 2).any(axis=1)
     pred_pos = (pred_c5_matrix != 2).any(axis=1)

@@ -63,7 +63,7 @@ CONFIG = {
     "train_samples_per_epoch": 1_000,
 
     # "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints",
-    "out_dir": "/media/rp/Elements1/abhay_ws/RCC_modeling/CNN_model/checkpoints_v7",
+    "out_dir": "./CNN_model/checkpoints_v8",
     "save_every": 100,
     "wandb_project": "rcc_regression_cnn",
     "wandb_name": None,
@@ -75,7 +75,7 @@ CONFIG = {
     "huber_delta": 1.0,
 
     # Classification-from-regression evaluation
-    "classify_every": 50,
+    "classify_every": 10,
     "class_boundaries": [0.5, 0.75],
 }
 
@@ -90,6 +90,8 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import wandb
+import itertools  # ADDED
+import json       # ADDED
 
 # ----------------------------
 # Utilities
@@ -734,13 +736,177 @@ def main():
     trial_col = config["trial_col"]
     trials_arr = df[trial_col].values
     unique_trials = pd.unique(trials_arr)  # preserves order of appearance
-    rng = np.random.default_rng(config["seed"])  # deterministic
-    perm = rng.permutation(len(unique_trials))
-    n_val_trials = max(1, int(math.ceil(len(unique_trials) * config["val_split"])))
-    val_trial_ids = set(unique_trials[perm[:n_val_trials]])
-    train_trial_ids = set(unique_trials) - val_trial_ids
 
-    # Build segments once, then filter per split
+    # ------------------------------
+    # NEW: Trial subset selection enforcing:
+    # 1. Validation consists of whole trials only.
+    # 2. Validation ratio within 10% relative of target (val_split).
+    # 3. Train/Val per-dimension MIN and MAX are approximately equal (within tolerance) when normalized by global range.
+    # ------------------------------
+    target_val_ratio = float(config["val_split"])
+    ratio_tol = 0.10  # 10%
+    minmax_tol = 0.05  # 5%
+
+    # Precompute per-trial indices
+    trial_to_indices: dict[str, np.ndarray] = {}
+    for t in unique_trials:
+        trial_to_indices[str(t)] = np.where(trials_arr == t)[0]
+
+    total_len = len(df)
+
+    # Precompute label arrays for efficiency
+    label_values = df[config["label_cols"]].values.astype(np.float32)
+    # Global stats used to normalize min/max differences (stable even if values near 0)
+    global_mins = label_values.min(axis=0)
+    global_maxs = label_values.max(axis=0)
+    global_ranges = np.maximum(global_maxs - global_mins, 1e-8)
+
+    def compute_ranges(indices: np.ndarray):
+        subset = label_values[indices]
+        mins = subset.min(axis=0)
+        maxs = subset.max(axis=0)
+        ranges = maxs - mins
+        return mins, maxs, ranges
+
+    best_subset = None
+    best_ratio_diff = float("inf")
+
+    trial_list = [str(t) for t in unique_trials]
+    n_trials = len(trial_list)
+
+    # Enumerate all subsets (except empty/full) – feasible (e.g. 2^15=32768)
+    for r in range(1, n_trials):
+        for combo in itertools.combinations(trial_list, r):
+            val_indices = np.concatenate([trial_to_indices[t] for t in combo])
+            val_len = len(val_indices)
+            val_ratio = val_len / total_len
+            # Check ratio tolerance first
+            if abs(val_ratio - target_val_ratio) / max(target_val_ratio, 1e-8) > ratio_tol:
+                continue
+            train_trials = [t for t in trial_list if t not in combo]
+            train_indices = np.concatenate([trial_to_indices[t] for t in train_trials])
+            # Compute min/max
+            train_mins, train_maxs, _ = compute_ranges(train_indices)
+            val_mins, val_maxs, _ = compute_ranges(val_indices)
+            # Relative min/max difference normalized by global range
+            rel_min_diff = np.abs(train_mins - val_mins) / global_ranges
+            rel_max_diff = np.abs(train_maxs - val_maxs) / global_ranges
+            if np.any(rel_min_diff > minmax_tol) or np.any(rel_max_diff > minmax_tol):
+                continue
+            # Candidate acceptable
+            ratio_diff = abs(val_ratio - target_val_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_subset = {
+                    "val_trials": set(combo),
+                    "train_trials": set(train_trials),
+                    "val_indices": val_indices,
+                    "train_indices": train_indices,
+                    "val_ratio": val_ratio,
+                    "train_mins": train_mins.tolist(),
+                    "train_maxs": train_maxs.tolist(),
+                    "val_mins": val_mins.tolist(),
+                    "val_maxs": val_maxs.tolist(),
+                    "rel_min_diff": rel_min_diff.tolist(),
+                    "rel_max_diff": rel_max_diff.tolist(),
+                }
+        if best_ratio_diff == 0:
+            break
+
+    if best_subset is None:
+        # Fallback: ratio only (ignore min/max), choose deterministic permutation like original method.
+        rng = np.random.default_rng(config["seed"])  # deterministic
+        perm = rng.permutation(len(unique_trials))
+        n_val_trials = max(1, int(math.ceil(len(unique_trials) * target_val_ratio)))
+        val_trial_ids = set(unique_trials[perm[:n_val_trials]])
+        train_trial_ids = set(unique_trials) - val_trial_ids
+        print("WARNING: Could not find trial subset satisfying ratio + min/max constraints; using ratio-only split.")
+        # Compute min/max and relative diffs for reporting
+        train_indices_fb = np.concatenate([trial_to_indices[str(t)] for t in train_trial_ids])
+        val_indices_fb = np.concatenate([trial_to_indices[str(t)] for t in val_trial_ids])
+        train_mins, train_maxs, _ = compute_ranges(train_indices_fb)
+        val_mins, val_maxs, _ = compute_ranges(val_indices_fb)
+        rel_min_diff_fb = np.abs(train_mins - val_mins) / global_ranges
+        rel_max_diff_fb = np.abs(train_maxs - val_maxs) / global_ranges
+        split_meta = {
+            "target_val_ratio": target_val_ratio,
+            "actual_val_ratio": float(len(val_indices_fb) / total_len),
+            "val_trials": sorted(list(val_trial_ids)),
+            "train_trials": sorted(list(train_trial_ids)),
+            "label_minmax": {
+                "global": {col: {"min": float(global_mins[i]), "max": float(global_maxs[i]), "range": float(global_ranges[i])}
+                            for i, col in enumerate(config["label_cols"])},
+                "train": {col: {"min": float(train_mins[i]), "max": float(train_maxs[i])}
+                           for i, col in enumerate(config["label_cols"])},
+                "val": {col: {"min": float(val_mins[i]), "max": float(val_maxs[i])}
+                         for i, col in enumerate(config["label_cols"])},
+                "relative_min_diff": {col: float(rel_min_diff_fb[i]) for i, col in enumerate(config["label_cols"])},
+                "relative_max_diff": {col: float(rel_max_diff_fb[i]) for i, col in enumerate(config["label_cols"])},
+            },
+            "constraints_met": False
+        }
+    else:
+        val_trial_ids = set(best_subset["val_trials"])
+        train_trial_ids = set(best_subset["train_trials"])
+        split_meta = {
+            "target_val_ratio": target_val_ratio,
+            "actual_val_ratio": best_subset["val_ratio"],
+            "val_trials": sorted(list(val_trial_ids)),
+            "train_trials": sorted(list(train_trial_ids)),
+            "label_minmax": {
+                "global": {col: {"min": float(global_mins[i]), "max": float(global_maxs[i]), "range": float(global_ranges[i])}
+                            for i, col in enumerate(config["label_cols"])},
+                "train": {col: {"min": float(best_subset["train_mins"][i]), "max": float(best_subset["train_maxs"][i])}
+                           for i, col in enumerate(config["label_cols"])},
+                "val": {col: {"min": float(best_subset["val_mins"][i]), "max": float(best_subset["val_maxs"][i])}
+                         for i, col in enumerate(config["label_cols"])},
+                "relative_min_diff": {col: float(best_subset["rel_min_diff"][i]) for i, col in enumerate(config["label_cols"])},
+                "relative_max_diff": {col: float(best_subset["rel_max_diff"][i]) for i, col in enumerate(config["label_cols"])},
+            },
+            "constraints_met": True
+        }
+
+    # Persist split metadata for reproducibility (used by eval script)
+    split_path = os.path.join(config["out_dir"], "data_split.json")
+    try:
+        with open(split_path, "w") as f:
+            json.dump(split_meta, f, indent=2)
+        print(f"Saved data split metadata to {split_path}")
+        # NEW: write trial-level split labels CSV
+        trial_split_csv = os.path.join(config["out_dir"], "trial_split_labels.csv")
+        import csv as _csv
+        with open(trial_split_csv, "w", newline="") as fcsv:
+            writer = _csv.writer(fcsv)
+            writer.writerow(["trial", "split"])  # header
+            for t in sorted(list(train_trial_ids)):
+                writer.writerow([t, "train"])
+            for t in sorted(list(val_trial_ids)):
+                writer.writerow([t, "val"])
+        print(f"Saved trial split labels to {trial_split_csv}")
+    except Exception as e:
+        print(f"Failed to save data split metadata or trial labels: {e}")
+
+    print(f"Selected val trials ({len(val_trial_ids)}): {sorted(list(val_trial_ids))}")
+    print(f"Selected train trials ({len(train_trial_ids)}): {sorted(list(train_trial_ids))}")
+    print(f"Actual val ratio: {split_meta['actual_val_ratio']:.4f} (target={target_val_ratio:.4f}) | constraints_met={split_meta['constraints_met']}")
+    for i, col in enumerate(config["label_cols"]):
+        tmin = split_meta["label_minmax"]["train"][col]["min"]
+        tmax = split_meta["label_minmax"]["train"][col]["max"]
+        vmin = split_meta["label_minmax"]["val"][col]["min"]
+        vmax = split_meta["label_minmax"]["val"][col]["max"]
+        rmin = split_meta["label_minmax"]["relative_min_diff"][col]
+        rmax = split_meta["label_minmax"]["relative_max_diff"][col]
+        print(f"{col}: train[min,max]=({tmin:.4f},{tmax:.4f}) | val[min,max]=({vmin:.4f},{vmax:.4f}) | rel_min_diff={rmin:.4f} rel_max_diff={rmax:.4f}")
+
+    # Optionally log to wandb once
+    wandb.log({
+        "data_split_actual_val_ratio": split_meta['actual_val_ratio'],
+        **{f"data_split_rel_min_diff_{col}": split_meta['label_minmax']['relative_min_diff'][col] for col in config['label_cols']},
+        **{f"data_split_rel_max_diff_{col}": split_meta['label_minmax']['relative_max_diff'][col] for col in config['label_cols']},
+        "data_split_constraints_met": split_meta['constraints_met']
+    })
+
+    # NEW: build segments now that trials are split
     N = len(df)
     all_segments = compute_trial_segments(trials_arr, 0, N)
     train_segments = filter_segments_by_trials(all_segments, trials_arr, train_trial_ids)
